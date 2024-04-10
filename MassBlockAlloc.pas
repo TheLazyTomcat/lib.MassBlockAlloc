@@ -36,6 +36,30 @@
 
 ===============================================================================}
 unit MassBlockAlloc;
+{
+  MassBlockAlloc_UseAuxExceptions
+  All_UseAuxExceptions
+
+  If you want library-specific exceptions to be based on more advanced classes
+  provided by AuxExceptions library instead of basic Exception class, and don't
+  want to or cannot change code in this unit, you can define global symbol
+  MassBlockAlloc_UseAuxExceptions or All_UseAuxExceptions to do so.
+
+    NOTE - if you globally define symbol All_UseAuxExceptions, then exception
+           classes in all units that support his feature will be rebased, not
+           only classes from this unit.
+}
+{$IF Defined(MassBlockAlloc_UseAuxExceptions) or Defined(All_UseAuxExceptions)}
+  {$DEFINE UseAuxExceptions}
+{$IFEND}
+
+{$IF defined(CPU64) or defined(CPU64BITS)}
+  {$DEFINE CPU64bit}
+{$ELSEIF defined(CPU16)}
+  {$MESSAGE FATAL '16bit CPU not supported'}
+{$ELSE}
+  {$DEFINE CPU32bit}
+{$IFEND}
 
 {$IF Defined(WINDOWS) or Defined(MSWINDOWS)}
   {$DEFINE Windows}
@@ -53,17 +77,32 @@ unit MassBlockAlloc;
 {$ENDIF}
 {$H+}
 
+//------------------------------------------------------------------------------
+{$UNDEF AllowLargeSegments}
+{$IFDEF MassBlockAlloc_AllowLargeSegments_On}
+  {$DEFINE AllowLargeSegments}
+{$ENDIF}
+
 interface
 
 uses
   SysUtils, Classes, SyncObjs,
-  AuxTypes, AuxClasses, BitVector, BitOps;
+  AuxTypes, AuxClasses, BitVector, BitOps
+  {$IFDEF UseAuxExceptions}, AuxExceptions{$ENDIF};
+
+{===============================================================================
+    Public constants
+===============================================================================}
+const
+  OneKiB = TMemSize(1024);          // one kibibyte (2^10, kilobyte for you oldschools :P)
+  OneMiB = TMemSize(1024 * OneKiB); // one mebibyte (2^20, megabyte)
+  OneGiB = TMemSize(1024 * OneMiB); // one gibibyte (2^30, gigabyte)
 
 {===============================================================================
     Library-specific exception
 ===============================================================================}
 type
-  EMBAException = class(Exception);
+  EMBAException = class({$IFDEF UseAuxExceptions}EAEGeneralException{$ELSE}Exception{$ENDIF});
 
   EMBASystemError      = class(EMBAException);
   EMBAInvalidValue     = class(EMBAException);
@@ -78,17 +117,35 @@ type
                                    TMBASegment
 --------------------------------------------------------------------------------
 ===============================================================================}
+type
+  TMBAPointerArray = array of Pointer;
+
+// - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+type
+  TMBASegmentSizingStyle = (szMinCount,szMinSize,szExactSize);
+
+  TMBASegmentSettings = record
+    FailOnUnfreed:  Boolean;
+    MapInSegment:   Boolean;
+    BlockSize:      TMemSize;
+    Alignment:      TMemoryAlignment;
+    case SizingStyle: TMBASegmentSizingStyle of
+      szMinCount:   (BlockCount:  Integer);
+      szMinSize,
+      szExactSize:  (MemorySize:  TMemSize);
+  end;
+
 {===============================================================================
     TMBASegment - class declaration
 ===============================================================================}
 type
   TMBASegment = class(TCustomListObject)
   protected
-    fBlockSize:         TMemSize;
+    fSettings:          TMBASegmentSettings;
     fReservedBlockSize: TMemSize;
     fBlockCount:        Integer;
-    fMemory:            Pointer;
     fMemorySize:        TMemSize;
+    fMemory:            Pointer;
     fAllocationMap:     TBitVectorStatic;
     fLowAddress:        Pointer;  // address of first block
     fHighAddress:       Pointer;  // address BEHIND the last block (reserved size)
@@ -101,33 +158,147 @@ type
     Function GetCount: Integer; override;
     procedure SetCount(Value: Integer); override;
     // init/final
-    procedure Initialize(BlockSize: TMemSize; MinBlockCount: Integer; MemoryAlignment: TMemoryAlignment); virtual;
-    procedure Finalize; virtual;       
+    Function CalculateMemorySize: TMemSize; virtual;
+    Function CalculateBlockCount: Integer; virtual;
+    procedure Initialize(const Settings: TMBASegmentSettings); virtual;
+    procedure Finalize; virtual;
     // auxiliary methods and utilities
-    class procedure Calculate(BlockSize: TMemSize; MinBlockCount: Integer; MemoryAlignment: TMemoryAlignment;
-                              out ReservedBlockSize, MemorySize: TMemSize; out BlockCount: Integer); virtual;
-    Function FindSpaceForVector(VectorLength: Integer; out ReqBlockCount: Integer): Integer; virtual;
+    Function FindSpaceForBuffer(BufferSize: TMemSize; out RequiredBlockCount: Integer): Integer; virtual;
   public
+  {
+    MemoryPageSize
+
+    Returns size of memory page (in bytes) as indicated by operating system for
+    the calling program.
+  }
     class Function MemoryPageSize: TMemSize; virtual;
-    class Function CalculateVectorReqBlockCount(BlockSize: TMemSize; VectorLength: Integer; MemoryAlignment: TMemoryAlignment): Integer; virtual;
-    class Function CalculateMemorySize(BlockSize: TMemSize; MinBlockCount: Integer; MemoryAlignment: TMemoryAlignment): TMemSize; virtual;
-    class Function CalculateBlockCount(BlockSize: TMemSize; MinBlockCount: Integer; MemoryAlignment: TMemoryAlignment): Integer; virtual;
-    constructor Create(BlockSize: TMemSize; MinBlockCount: Integer; MemoryAlignment: TMemoryAlignment);
+    constructor Create(const Settings: TMBASegmentSettings);
     destructor Destroy; override;
     Function LowIndex: Integer; override;
     Function HighIndex: Integer; override;
+  {
+    BufferBlockCount
+
+    Returns number of blocks withing this segment needed to allocate a buffer
+    of given size (note that the full RESERVED block size is taken into account
+    in this calculation).
+
+      NOTE - it might return a number larger than BlockCount, this is not
+             checked as this function is considered to be only informative.
+  }
+    Function BufferBlockCount(BufferSize: TMemSize): Integer; overload; virtual;
     // address checks
+  {
+    AddressOwned
+
+    Returns true when the given address is within any present block (points to
+    a byte that is part of the block), false otherwise.
+
+    When strict is true, then the address must be within its indicated size
+    (Settings.BlockSize), when strict is false then it can lay anywhere within
+    reserved block size (ie. it can point into block padding).
+  }
     Function AddressOwned(Address: Pointer; Strict: Boolean = False): Boolean; virtual;
+  {
+    AddressIndexOf
+
+    Returns index of block to which the given address points.
+
+    If strict is true, then only indicated block size is observed, otherwise
+    the address can be anywhere within reserved memory of the block.
+
+    When the address does not point to any present block (or points to padding
+    when Strict is true), then a negative value is returned.
+  }
     Function AddressIndexOf(Address: Pointer; Strict: Boolean = False): Integer; virtual;
+  {
+    BlockOwned
+
+    Returns true when the given address points to any present block (its
+    starting address), false otherwise.
+  }
     Function BlockOwned(Block: Pointer): Boolean; virtual;
+  {
+    BlockIndexOf
+
+    Returns index of block of the given starting address. If the address does
+    not point to any block, then a negative value is returned.
+  }
     Function BlockIndexOf(Block: Pointer): Integer; virtual;
     // (de)allocation methods
+  {
+    AllocateBlock
+
+    Selects first unallocated block, marks it as allocated and sets Block param
+    to its address. If no block can be allocated, then an exception of class
+    EMBAOutOfResources is raised.
+
+    Can also raise an EMBAInvalidState exception if internal data are somehow
+    damaged.
+
+    When init memory is set to true, then the block memory is cleared (filled
+    with zeroes), otherwise its content is completely undefined and might
+    contain content from when it was previously allocated. 
+  }
     procedure AllocateBlock(out Block: Pointer; InitMemory: Boolean); virtual;
+  {
+    FreeBlock
+
+    Marks given block as not allocated and sets Block parameter to nil.
+
+    If given pointer does not point to a block withing this segment, then an
+    exception of class EMBAInvalidAddress is raised.
+
+    If freeing buffer that is not allocated, then an EMBAInvalidState exception
+    is raised.
+  }
     procedure FreeBlock(var Block: Pointer); virtual;
-    Function CanAllocateBlockVector(VectorLength: Integer): Boolean; virtual;
-    Function TryAllocateBlockVector(out Vector: Pointer; VectorLength: Integer; InitMemory: Boolean): Boolean; virtual;
-    procedure AllocateBlockVector(out Vector: Pointer; VectorLength: Integer; InitMemory: Boolean); virtual;
-    procedure FreeBlockVector(var Vector: Pointer; VectorLength: Integer); virtual;
+  {
+    CanAllocateBuffer
+
+    Returns true if this segmant can allocate buffer of given size, false
+    otherwise.
+  }
+    Function CanAllocateBuffer(BufferSize: TMemSize): Boolean; virtual;
+  {
+    TryAllocateBuffer
+
+    Tries to allocate buffer of given size. True is returned when it succeeds,
+    false otherwise - in which case nothing is allocated and value of Buffer is
+    undefined.
+  }
+    Function TryAllocateBuffer(out Buffer: Pointer; BufferSize: TMemSize; InitMemory: Boolean): Boolean; virtual;
+  {
+    AllocateBuffer
+
+    Allocates buffer of given size.
+
+    Buffer size must be larger than zero, otherwise an EMBAInvalidValue
+    exception is raised.
+
+    If it cannot be allocated (eg. because there is not enough contiguous free
+    blocks), then EMBAOutOfResources exception is raised.
+  }
+    procedure AllocateBuffer(out Buffer: Pointer; BufferSize: TMemSize; InitMemory: Boolean); virtual;
+  {
+    FreeBuffer
+
+    Deallocates all constituent blocks of given buffer and sets parameter Buffer
+    to nil.
+
+    If the Buffer does not point to any block within this segment, then an
+    EMBAInvalidAddress exception is raised.
+
+    BufferSize must be larger than zero, otherwise an EMBAInvalidValue exception
+    is raised.
+
+    If the buffer size is not a valid number (eg. it is not the same number as
+    was used during allocation), then an EMBAInvalidValue or EMBAInvalidState
+    exception can be raised.
+  }
+    procedure FreeBuffer(var Buffer: Pointer; BufferSize: TMemSize); virtual;
+    {$message 'todo'}
+    //procedure BurstAllocate(out Blocks: TMBAPointerArray); virtual;
     // informative methods
     Function IsFull: Boolean; virtual;
     Function IsEmpty: Boolean; virtual;
@@ -138,37 +309,89 @@ type
     Function BlocksMemory: TMemSize; virtual;     // memory of all blocks (excluding padding, so only BlockCount * BlockSize)
     Function AllocatedMemory: TMemSize; virtual;  // memory of allocated blocks (excluding padding)
     Function WastedMemory: TMemSize; virtual;     // all padding (including individual blocks)
-    Function MemoryEffeciency: Double; virtual;   // (MemorySize - WastedMemory) / MemorySize
-    Function MemoryUtilization: Double; virtual;  // AllocatedMemory / BlocksMemory
+    Function MemoryEfficiency: Double; virtual;   // (MemorySize - WastedMemory) / MemorySize (ignores unused space of buffers/vectors)
+    Function MemoryUtilization: Double; virtual;  // AllocatedMemory / BlocksMemory (ignores unused space of buffers/vectors)
     // properties
     property Capacity: Integer read GetCapacity;
     property Count: Integer read GetCount;
-    property BlockSize: TMemSize read fBlockSize;
+    property Settings: TMBASegmentSettings read fSettings;
     property ReservedBlockSize: TMemSize read fReservedBlockSize;
     property BlockCount: Integer read fBlockCount;
-    property Memory: Pointer read fMemory;
     property MemorySize: TMemSize read fMemorySize;
+    property Memory: Pointer read fMemory;
     property AllocationMap[Index: Integer]: Boolean read GetIsAllocated;
     property Blocks[Index: Integer]: Pointer read GetBlockAddress; default;
   end;
 
 {===============================================================================
 --------------------------------------------------------------------------------
-                              TMassBlockAllocNoLock
+                                 TMassBlockAlloc
 --------------------------------------------------------------------------------
 ===============================================================================}
+type
+  TMBAAllocatorSettings = record
+    FreeEmptySegments:  Boolean;
+    ThreadProtection:   Boolean;
+    CacheSettings:      record
+      Enable:             Boolean;
+      Length:             Integer;
+      TrustedReturns:     Boolean;
+      AsynchronousFill:   record
+        Enable:             Boolean;
+        Interruptable:      Boolean;        
+        CycleLength:        UInt32;
+      end;
+    end;
+    SegmentSettings:  TMBASegmentSettings;
+  end;
+
+const
+  DefaultAllocatorSettings: TMBAAllocatorSettings = (
+    FreeEmptySegments:  False;
+    ThreadProtection:   True;
+    CacheSettings:      (
+      Enable:             True;
+      Length:             128;
+      TrustedReturns:     True;
+      AsynchronousFill:   (
+        Enable:             False;
+        Interruptable:      True;
+        CycleLength:        1000));
+    SegmentSettings:    (
+      FailOnUnfreed:      True;
+      MapInSegment:       False;
+      BlockSize:          0;      // needs to be set by user
+      Alignment:          maNone;
+      SizingStyle:        szMinCount;
+      BlockCount:         0));    // needs to be set by user
+
+// - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+type
+  TMBACache = record
+    Enabled:      Boolean;
+    Data:         array of Pointer; // must be thread protected
+    Count:        Integer;          // -||-
+    AsyncFill:    record
+      Enabled:        Boolean;
+      Interrupts:     Boolean;
+      InterruptFlag:  Integer;      // interlocked access only
+      CycleEvent:     TEvent;
+      FillerThread:   TThread;
+    end;
+  end;
+  PMBACache = ^TMBACache;
+
 {===============================================================================
-    TMassBlockAllocNoLock - class declaration
+    TMassBlockAlloc - class declaration
 ===============================================================================}
 type
-  TMassBlockAllocNoLock = class(TCustomListObject)
+  TMassBlockAlloc = class(TCustomListObject)
   protected
-    fBlockSize:           TMemSize;
-    fMinBlocksPerSegment: Integer;
-    fMemoryAlignment:     TMemoryAlignment;
-    fSegments:            array of TMBASegment;
-    fSegmentCount:        Integer;
-    fThreadLock:          TCriticalSection;
+    fSettings:      TMBAAllocatorSettings;
+    fSegments:      array of TMBASegment;
+    fSegmentCount:  Integer;
+    fThreadLock:    TCriticalSection;
+    fCache:         TMBACache;
     // getters setters
     Function GetSegment(Index: Integer): TMBASegment; virtual;
     // inherited list methods
@@ -181,28 +404,51 @@ type
     procedure DeleteSegment(Index: Integer); virtual;
     procedure ClearSegments; virtual;
     // init/final
-    procedure Initialize(BlockSize: TMemSize; MinBlocksPerSegment: Integer; MemoryAlignment: TMemoryAlignment); virtual;
+    procedure Initialize(Settings: TMBAAllocatorSettings); virtual;
     procedure Finalize; virtual;
     // other internals
-    procedure InternalLock; virtual;
-    procedure InternalUnlock; virtual;
+    procedure InternalAllocateBlock(out Block: Pointer; InitMemory: Boolean); virtual;
+    procedure InternalFreeBlock(var Block: Pointer); virtual;
+    procedure InternalAllocateBlocks(out Blocks: array of Pointer; InitMemory: Boolean); virtual;
+    procedure InternalFreeBlocks(var Blocks: array of Pointer); virtual;
+    Function InternalCacheFill(AsyncFill: Boolean): Integer; virtual;
   public
-    constructor Create(BlockSize: TMemSize; MinBlocksPerSegment: Integer; MemoryAlignment: TMemoryAlignment = maNone);
+    constructor Create(Settings: TMBAAllocatorSettings); overload;
+    constructor Create(BlockSize: TMemSize; MinBlocksPerSegment: Integer; MemoryAlignment: TMemoryAlignment = maNone); overload;
     destructor Destroy; override;
     Function LowIndex: Integer; override;
     Function HighIndex: Integer; override;
-    // thread-locking facility
-    procedure Lock; virtual;
-    procedure Unlock; virtual;
-    // main (de)allocation functions
-    Function AllocateBlock(InitMemory: Boolean = False): Pointer; overload; virtual;
+    procedure ThreadLockAcquire; virtual;
+    procedure ThreadLockRelease; virtual;
+    procedure AllocationAcquire; virtual;
+    procedure AllocationRelease; virtual;
+    // single block (de)allocation
     procedure AllocateBlock(out Block: Pointer; InitMemory: Boolean = False); overload; virtual;
-    procedure AllocateBlocks(out Blocks: array of Pointer; InitMemory: Boolean = False); virtual;
-    procedure AllocateBlockVector(out Vector: Pointer; VectorLength: Integer; InitMemory: Boolean = False); virtual;
+    Function AllocateBlock(InitMemory: Boolean = False): Pointer; overload; virtual;
     procedure FreeBlock(var Block: Pointer); virtual;
+    // multiple blocks (de)allocation
+    procedure AllocateBlocks(out Blocks: array of Pointer; InitMemory: Boolean = False); virtual;
     procedure FreeBlocks(var Blocks: array of Pointer); virtual;
+    // buffer (de)allocation
+    procedure AllocateBuffer(out Buffer: Pointer; BufferSize: TMemSize; InitMemory: Boolean = False); virtual;
+    procedure FreeBuffer(var Buffer: Pointer; BufferSize: TMemSize); virtual;
+    // block vector (de)allocation
+    procedure AllocateBlockVector(out Vector: Pointer; VectorLength: Integer; InitMemory: Boolean = False); virtual;
     procedure FreeBlockVector(var Vector: Pointer; VectorLength: Integer); virtual;
-    // informations and statistics
+    // cache management
+    Function CacheCount: Integer; virtual;
+    procedure CacheFill(ForceSynchronous: Boolean = False); virtual;
+    // cached (de)allocation
+    procedure CacheAllocateBlock(out Block: Pointer; InitMemory: Boolean = False); overload; virtual;
+    Function CacheAllocateBlock(InitMemory: Boolean = False): Pointer; overload; virtual;
+    procedure CacheFreeBlock(var Block: Pointer); virtual;
+    procedure CacheAllocateBlocks(out Blocks: array of Pointer; InitMemory: Boolean = False); virtual;
+    procedure CacheFreeBlocks(var Blocks: array of Pointer); virtual;
+    {$message 'todo'}
+    //Function PrepareFor(Count: Integer): Integer; virtual;
+    // return all blocks from an empty segment (existing or newly created)
+    //procedure BurstAllocateBlocks(out Blocks: TMBAPointerArray); virtual;
+    // informations and statistics (note that all following functions are subject to thread locking)
     Function SegmentSize: TMemSize; virtual;
     Function BlocksPerSegment: Integer; virtual;
     Function AllocatedBlockCount: Integer; virtual;
@@ -212,65 +458,35 @@ type
     Function TotalAllocatedMemory: TMemSize; virtual;
     Function TotalWastedMemory: TMemSize; virtual;
     Function TotalMemorySize: TMemSize; virtual;
-    Function MemoryEffeciency: Double; virtual;
+    Function MemoryEfficiency: Double; virtual;
     Function MemoryUtilization: Double; virtual;
     // properties
-    property BlockSize: TMemSize read fBlockSize;
-    property MinBlocksPerSegment: Integer read fMinBlocksPerSegment;
-    property MemoryAlignment: TMemoryAlignment read fMemoryAlignment;
+    property Settings: TMBAAllocatorSettings read fSettings;
     property Count: Integer read GetCount;
     property SegmentCount: Integer read GetCount;
     property Segments[Index: Integer]: TMBASegment read GetSegment; default;
   end;
 
-{===============================================================================
---------------------------------------------------------------------------------
-                                 TMassBlockAlloc
---------------------------------------------------------------------------------
-===============================================================================}
-{===============================================================================
-    TMassBlockAlloc - class declaration
-===============================================================================}
-type
-  TMassBlockAlloc = class(TMassBlockAllocNoLock)
-  protected
-    procedure InternalLock; override;
-    procedure InternalUnlock; override;
-  end;
-
-{===============================================================================
---------------------------------------------------------------------------------
-                              TMassBlockAllocCached                                                            
---------------------------------------------------------------------------------
-===============================================================================}
-{===============================================================================
-    TMassBlockAllocCached - class declaration
-===============================================================================}
-type
-  TMassBlockAllocCached = class(TMassBlockAlloc)
-  protected
-    fCacheData:   array of Pointer;
-    fCacheCount:  Integer;
-    procedure Initialize(BlockSize: TMemSize; MinBlocksPerSegment: Integer; MemoryAlignment: TMemoryAlignment = maNone); override;
-    procedure Finalize; override;
-  public
-    Function CacheAllocateBlock(InitMemory: Boolean = False): Pointer; overload; virtual;
-    procedure CacheAllocateBlock(out Block: Pointer; InitMemory: Boolean = False); overload; virtual;
-    procedure CacheAllocateBlocks(out Blocks: array of Pointer; InitMemory: Boolean = False); virtual;
-    procedure CacheFill(Count: Integer = -1); virtual;
-    property CacheCount: Integer read fCacheCount;
-  end;
-
 implementation
 
 uses
-  {$IFDEF Windows}Windows,{$ELSE}baseunix,{$ENDIF} Math;
+  {$IFDEF Windows}Windows,{$ELSE}baseunix,{$ENDIF} 
+  AuxMath;
 
 {$IFDEF FPC_DisableWarns}
   {$DEFINE FPCDWM}
   {$DEFINE W4055:={$WARN 4055 OFF}} // Conversion between ordinals and pointers is not portable}
   {$DEFINE W5024:={$WARN 5024 OFF}} // Parameter "$1" not used
 {$ENDIF}
+
+{===============================================================================
+    Internals
+===============================================================================}
+const
+  // maximum size of segment
+  MBA_MAX_SEG_SZ = TMemSize({$IFDEF AllowLargeSegments}4 * {$ENDIF}{$IFDEF CPU64bit}OneGiB{$ELSE}256 * OneMiB{$ENDIF});
+  // maximum size of one block
+  MBA_MAX_BLK_SZ = TMemSize(128 * OneMiB);
 
 {===============================================================================
     Externals
@@ -286,23 +502,6 @@ const
   _SC_PAGESIZE = 30;  {$message 'check this value'} 
 
 {$ENDIF}
-
-{===============================================================================
-    Helper constants, functions, ...
-===============================================================================}
-const
-  OneGiB = 1024 * 1024 * 1024;  // one gibibyte (2^30, gigabyte for you oldschools :P)
-
-//------------------------------------------------------------------------------  
-
-{$IF not Declared(Ceil64)}
-Function Ceil64(x: Extended): Int64;
-begin
-Result := Trunc(x);
-If Frac(x) > 0 then
-  Result := Result + 1;
-end;
-{$IFEND}
 
 {===============================================================================
 --------------------------------------------------------------------------------
@@ -368,15 +567,184 @@ end;
 
 //------------------------------------------------------------------------------
 
-procedure TMBASegment.Initialize(BlockSize: TMemSize; MinBlockCount: Integer; MemoryAlignment: TMemoryAlignment);
+Function TMBASegment.CalculateMemorySize: TMemSize;
+var
+  PredAlign:      TMemSize;
+  PredAlignBytes: TMemSize;
+  PageSize:       TMemSize;
+  TempMemorySize: TMemSize;
 begin
-fBlockSize := BlockSize;
-Calculate(BlockSize,MinBlockCount,MemoryAlignment,fReservedBlockSize,fMemorySize,fBlockCount);
+{
+  Calculation legend:
+
+    P ... page size
+    A ... alignment bytes (expected to be integral power of two)
+    B ... reserved block size
+
+    m ... minimal memory size
+    n ... size of allocation map
+    c ... minimal block count
+
+    M ... memory size (result)
+}
+PredAlign := AlignmentBytes(fSettings.Alignment);
+PredAlignBytes := Pred(PredAlign);
+PageSize := MemoryPageSize;
+case fSettings.SizingStyle of
+  szMinCount:
+    begin
+      If fSettings.BlockCount <= 0 then
+        raise EMBAInvalidValue.CreateFmt('TMBASegment.CalculateProperties: Invalid minimal block count (%d).',[fSettings.BlockCount]);
+      // maximum size check
+      If (fReservedBlockSize * TMemSize(fSettings.BlockCount)) > MBA_MAX_SEG_SZ then
+        raise EMBAInvalidValue.CreateFmt('TMBASegment.CalculateProperties: Segment would be too large (%u).',
+          [PtrInt(fReservedBlockSize * TMemSize(fSettings.BlockCount))]);
+      If fSettings.MapInSegment then
+      {
+        Calculate memory size with page granularity. Minimum size of memory
+        is requested number of blocks multiplied by reserved block size plus
+        worst-case alignment padding and size of allocation map.
+
+            M = ceil(m / P) * P
+
+              m = pred(A) + (c * B) + n
+
+                n = ceil(c / 8)
+      }
+        Result := uDivCeilPow2(PredAlignBytes + uDivCeilPow2NC(fSettings.BlockCount,8) +
+          (TMemSize(fSettings.BlockCount) * fReservedBlockSize),PageSize) * PageSize
+      else
+      {
+        Here, the minimum memory size is just number of blocks multiplied by
+        reserved block size plus worst-case padding. Memory size is again
+        selected with page granurality.
+
+            M = ceil(m / P) * P
+
+              m = pred(A) + (c * B)
+      }
+        Result := uDivCeilPow2(PredAlignBytes + (TMemSize(fSettings.BlockCount) * fReservedBlockSize),PageSize) * PageSize;
+    end;
+  szMinSize:
+    begin
+      If (fSettings.MemorySize <= 0) or (fSettings.MemorySize > MBA_MAX_SEG_SZ) then
+        raise EMBAInvalidValue.CreateFmt('TMBASegment.CalculateMemorySize: Invalid memory size (%u).',[PtrInt(fSettings.MemorySize)]);
+      // ensure the memory is large enough  
+      If fSettings.MemorySize < (fReservedBlockSize + PredAlignBytes + uIfThen(fSettings.MapInSegment,TMemSize(1),0)) then
+        TempMemorySize := fReservedBlockSize + PredAlignBytes + uIfThen(fSettings.MapInSegment,TMemSize(1),0)
+      else
+        TempMemorySize := fSettings.MemorySize;
+    {
+      Allocate with page granularity...
+
+          M = ceil(m / P) * P
+    }
+      Result := uDivCeilPow2(TempMemorySize,PageSize) * PageSize;
+    end;
+  szExactSize:
+    begin
+    {
+      The memory must be large enough to accomodate at least one block with
+      worst-case padding and optionally also its map (one bit for one block,
+      therefore one byte).
+
+          M >= (pred(A) + B) + 1
+    }
+      If fSettings.MemorySize < (fReservedBlockSize + PredAlignBytes + uIfThen(fSettings.MapInSegment,TMemSize(1),0)) then
+        raise EMBAInvalidValue.CreateFmt('TMBASegment.CalculateMemorySize: Memory size (%u) too small.',[PtrInt(fSettings.MemorySize)]);
+      If fSettings.MemorySize > MBA_MAX_SEG_SZ then
+        raise EMBAInvalidValue.CreateFmt('TMBASegment.CalculateMemorySize: Invalid memory size (%u).',[PtrInt(fSettings.MemorySize)]);
+      Result := fSettings.MemorySize;
+    end;
+else
+  raise EMBAInvalidValue.CreateFmt('TMBASegment.CalculateMemorySize: Unknown sizing style (%d).',[Ord(fSettings.SizingStyle)]);
+end;
+end;
+
+//------------------------------------------------------------------------------
+
+Function TMBASegment.CalculateBlockCount: Integer;
+var
+  TempQuotient:   TMemSize;
+  TempRemainder:  TMemSize;
+begin
+{
+  Calculation legend:
+
+    B ... reserved block size
+    M ... memory size
+
+    p ... padding for the first block (alignment offset)
+    a ... misalignment of the allocated memory
+
+    C ... block count (result)
+}
+If fSettings.MapInSegment then
+  begin
+  {
+    Subtract padding from the memory size and divide remaining bits(!) by
+    size of block in bits plus one bit in allocation map.
+
+        C = floor(8((M - p) / (8B + 1)))
+
+    A note on the actual imlementation - it is done this way to limit a risk of
+    overflow in multiplication (mainly 8 * M, as M can be a large number).
+  }
+    uDivMod(fMemorySize - AlignmentOffset(fMemory,fSettings.Alignment),(8 * fReservedBlockSize) + 1,TempQuotient,TempRemainder);
+    Result := CvtU2I32((8 * TempQuotient) + uDivFloor(8 * TempRemainder,(8 * fReservedBlockSize) + 1));
+  end
+{
+  Here it is simple, just subtract alignment offset from memory size and divide
+  what is left by reserved block size.
+
+      C = floor((M - p) / B)
+}
+else Result := CvtU2I32(uDivFloorPow2(fMemorySize - AlignmentOffset(fMemory,fSettings.Alignment),fReservedBlockSize));
+end;
+
+//------------------------------------------------------------------------------
+
+procedure TMBASegment.Initialize(const Settings: TMBASegmentSettings);
+type
+  TBitVectorClass = class of TBitVectorStatic;
+
+  Function GetAllocationMapClass: TBitVectorClass;
+  begin
+    If (fBlockCount and 31) <> 0 then
+      Result := TBitVectorStatic
+    else
+      Result := TBitVectorStatic32;
+  end;
+
+var
+  AlignBytes: TMemSize;
+begin
+fSettings := Settings;
+If (fSettings.BlockSize <= 0) or (fSettings.BlockSize > MBA_MAX_BLK_SZ) then
+  raise EMBAInvalidValue.CreateFmt('TMBASegment.Initialize: Invalid block size (%u).',[PtrInt(fSettings.BlockSize)]);
+// reserved block size must be a multiple of alignment bytes
+AlignBytes := AlignmentBytes(fSettings.Alignment);
+fReservedBlockSize := uDivCeilPow2(fSettings.BlockSize,AlignBytes) * AlignBytes;
+// calculate memory size and allocate memory accordingly
+fMemorySize := CalculateMemorySize;
+If fMemorySize <= 0 then
+  raise EMBAInvalidValue.CreateFmt('TMBASegment.Initialize: Invalid memory size (%u).',[PtrInt(fMemorySize)]);
 GetMem(fMemory,fMemorySize);
-fAllocationMap := TBitVectorStatic.Create(fMemory,fBlockCount);
-fAllocationMap.Fill(False);
-fLowAddress := AlignedMemory(PtrAdvance(fMemory,fAllocationMap.MemorySize),MemoryAlignment);
+fLowAddress := AlignedMemory(fMemory,fSettings.Alignment);
+// calculate how many blocks we can use
+fBlockCount := CalculateBlockCount;
+If fBlockCount <= 0 then
+  raise EMBAInvalidValue.CreateFmt('TMBASegment.Initialize: Invalid block count (%d).',[fBlockCount]);
+// prepare allocation map
 fHighAddress := PtrAdvance(fLowAddress,PtrInt(TMemSize(fBlockCount) * fReservedBlockSize));
+If fSettings.MapInSegment then
+  begin
+    // allocation map resides in segment's memory
+    fAllocationMap := GetAllocationMapClass.Create(fHighAddress,fBlockCount);
+    fAllocationMap.Fill(False);
+  end
+// allocation map manages its own memory buffer
+else fAllocationMap := GetAllocationMapClass.Create(fBlockCount,False);
 end;
 
 //------------------------------------------------------------------------------
@@ -384,131 +752,66 @@ end;
 procedure TMBASegment.Finalize;
 begin
 If Assigned(fAllocationMap) then
-  If not fAllocationMap.IsEmpty then
-    raise EMBAInvalidState.CreateFmt('TMBASegment.Finalize: Not all blocks were freed (%d).',[fAllocationMap.PopCount]);
-fAllocationMap.Free;
-FreeMem(fMemory,fMemorySize);
-end;
-
-//------------------------------------------------------------------------------
-
-class procedure TMBASegment.Calculate(BlockSize: TMemSize; MinBlockCount: Integer; MemoryAlignment: TMemoryAlignment;
-                                      out ReservedBlockSize, MemorySize: TMemSize; out BlockCount: Integer);
-var
-  PredAlignBytes: TMemSize;
-  PageSize:       TMemSize;
-begin
-If BlockSize > 0 then
   begin
-    If MinBlockCount > 0 then
-      begin
-        PredAlignBytes := Pred(AlignmentBytes(MemoryAlignment));
-        ReservedBlockSize := (BlockSize + PredAlignBytes) and not PredAlignBytes;
-        // sanity check
-        If (Int64(ReservedBlockSize) * Int64(MinBlockCount)) <= OneGiB then
-          begin
-            PageSize := MemoryPageSize;          
-          {
-            memory size...
-
-              P ... page size
-              A ... alignment bytes
-
-              m ... initial memory size
-              n ... initial size of allocation map with padding
-              c ... min. block count
-              b ... block size
-
-              M ... memory size (result)
-              B ... reserved block size
-
-                M = ceil(m / P) * P
-
-                  m = n + (c * B)
-
-                    n = ceil(ceil(c / 8) / A) * A = (((c + 7) shr 3) + pred(A)) and not pred(A)
-
-                    B = ceil(b / A) * A = (b + Pred(A)) and not Pred(A)
-          }
-            MemorySize := TMemSize(Ceil64((
-                ((((TMemSize(MinBlockCount) + 7) shr 3) + PredAlignBytes) and not PredAlignBytes) + // allocation map with padding
-                (TMemSize(MinBlockCount) * ReservedBlockSize)) / PageSize)) * PageSize;             // ensure page-size granularity
-          {
-            block count...
-
-              A ... alignment bytes
-
-              M ... memory size
-              C ... block count (result)
-              B ... reserved block size
-
-                  M = (ceil(C / 8A) * A) + CB
-                M/A = ceil(C / 8A) + (CB / A)
-
-                M/A >= (C / 8A) + (CB / A)
-                M/A >= (C / 8A) + (8CB / 8A)
-                M/A >= (8CB + C) / 8A
-                 8M >= C * (8B + 1)
-                  C <= 8M / (8B + 1)
-
-                  C = floor(8M / (8B + 1))
-          }
-            BlockCount := Floor((8 * MemorySize) / ((8 * ReservedBlockSize) + 1));
-          end
-        else raise EMBAInvalidValue.CreateFmt('TMBASegment.Calculate: Segment too large (%d).',[Int64(ReservedBlockSize) * Int64(MinBlockCount)]);
-      end
-    else raise EMBAInvalidValue.CreateFmt('TMBASegment.Calculate: Invalid minimal block count (%d).',[MinBlockCount]);
-  end
-else raise EMBAInvalidValue.CreateFmt('TMBASegment.Calculate: Invalid block size (%u).',[BlockSize]);
+    If not fAllocationMap.IsEmpty and fSettings.FailOnUnfreed then
+      raise EMBAInvalidState.CreateFmt('TMBASegment.Finalize: Not all blocks were freed (%d).',[fAllocationMap.PopCount]);
+    fAllocationMap.Free;
+  end;
+If Assigned(fMemory) and (fMemorySize <> 0) then
+  FreeMem(fMemory,fMemorySize);
 end;
 
 //------------------------------------------------------------------------------
 
-Function TMBASegment.FindSpaceForVector(VectorLength: Integer; out ReqBlockCount: Integer): Integer;
+Function TMBASegment.FindSpaceForBuffer(BufferSize: TMemSize; out RequiredBlockCount: Integer): Integer;
 var
-  i,j:      Integer;
-  SeqFound: Boolean;
+  i,j:            Integer;
+  SequenceFound:  Boolean;
 begin
-If VectorLength > 1 then
+If BufferSize > fReservedBlockSize then
   begin
   {
-    Find out how many consecutive blocks is needed. It might be less than
-    VectorLength, because we will also use the block padding (if any exists).
+    Find out how many consecutive blocks is needed (note that padding between
+    blocks, if present, is used too).
   }
-    ReqBlockCount := Ceil((TMemSize(VectorLength) * fBlockSize) / fReservedBlockSize);
-    If ReqBlockCount > 1 then
+    RequiredBlockCount := BufferBlockCount(BufferSize);
+    If RequiredBlockCount > 1 then  // this should never happen, but to be sure...
       begin
         Result := -1;
         // check if there is required number of free blocks
-        If FreeBlockCount >= ReqBlockCount then
+        If RequiredBlockCount <= FreeBlockCount then
           begin
-            // find if there is consecutive sequence of free blocks of required length
-            For i := fAllocationMap.FirstClean to (fAllocationMap.Count - ReqBlockCount) do
+            // find if there is a consecutive sequence of free blocks of required length
+            i := fAllocationMap.FirstClean;
+            repeat
               If not fAllocationMap[i] then
                 begin
-                  SeqFound := True;
-                  For j := Succ(i){because i is already checked} to Pred(i + ReqBlockCount) do
+                  SequenceFound := True;
+                  For j := Succ(i){because i-th item was already checked} to Pred(i + RequiredBlockCount) do
                     If fAllocationMap[j] then
                       begin
-                        SeqFound := False;
+                        SequenceFound := False;
+                        i := j; // note it will still be inc()-ed further down (so do not use j + 1)
                         Break{For j};
                       end;
-                  If SeqFound then
+                  If SequenceFound then
                     begin
                       Result := i;
-                      Break{For i};
+                      Break{repeat-until};
                     end;
                 end;
+              Inc(i);
+            until i > (fBlockCount - RequiredBlockCount);
           end;
       end
     else Result := fAllocationMap.FirstClean;
   end
-else If VectorLength > 0 then
+else If BufferSize > 0 then
   begin
-    ReqBlockCount := 1;
+    RequiredBlockCount := 1;
     Result := fAllocationMap.FirstClean;
   end
-else raise EMBAInvalidValue.CreateFmt('TMBASegment.FindSpaceForVector: Invalid vector length (%d).',[VectorLength]);
+else raise EMBAInvalidValue.CreateFmt('TMBASegment.FindSpaceForBuffer: Invalid buffer size (%u).',[PtrInt(BufferSize)]);
 end;
 
 {-------------------------------------------------------------------------------
@@ -539,44 +842,10 @@ end;
 
 //------------------------------------------------------------------------------
 
-class Function TMBASegment.CalculateVectorReqBlockCount(BlockSize: TMemSize; VectorLength: Integer; MemoryAlignment: TMemoryAlignment): Integer;
-var
-  PredAlignBytes: TMemSize;
+constructor TMBASegment.Create(const Settings: TMBASegmentSettings);
 begin
-PredAlignBytes := Pred(AlignmentBytes(MemoryAlignment));
-Result := Ceil((TMemSize(VectorLength) * BlockSize) / ((BlockSize + PredAlignBytes) and not PredAlignBytes));
-end;
-
-//------------------------------------------------------------------------------
-
-class Function TMBASegment.CalculateMemorySize(BlockSize: TMemSize; MinBlockCount: Integer; MemoryAlignment: TMemoryAlignment): TMemSize;
-var
-  TempReservedBlockSize:  TMemSize;
-  TempBlockCount:         Integer;
-begin
-Calculate(BlockSize,MinBlockCount,MemoryAlignment,TempReservedBlockSize,Result,TempBlockCount);
-end;
-
-//------------------------------------------------------------------------------
-
-class Function TMBASegment.CalculateBlockCount(BlockSize: TMemSize; MinBlockCount: Integer; MemoryAlignment: TMemoryAlignment): Integer;
-var
-  TempReservedBlockSize:  TMemSize;
-  TempMemorySize:         TMemSize;
-begin
-Calculate(BlockSize,MinBlockCount,MemoryAlignment,TempReservedBlockSize,TempMemorySize,Result);
-end;
-
-//------------------------------------------------------------------------------
-
-constructor TMBASegment.Create(BlockSize: TMemSize; MinBlockCount: Integer; MemoryAlignment: TMemoryAlignment);
-begin
-If BlockSize <= 0 then
-  raise EMBAInvalidValue.CreateFmt('TMBASegment.Create: Invalid block size (%d).',[BlockSize]);
-If MinBlockCount <= 0 then
-  raise EMBAInvalidValue.CreateFmt('TMBASegment.Create: Invalid minimal block count (%d).',[MinBlockCount]);
 inherited Create;
-Initialize(BlockSize,MinBlockCount,MemoryAlignment);
+Initialize(Settings);
 end;
 
 //------------------------------------------------------------------------------
@@ -603,6 +872,13 @@ end;
 
 //------------------------------------------------------------------------------
 
+Function TMBASegment.BufferBlockCount(BufferSize: TMemSize): Integer;
+begin
+Result := CvtU2I32(uDivCeilPow2(BufferSize,fReservedBlockSize))
+end;
+
+//------------------------------------------------------------------------------
+
 Function TMBASegment.AddressOwned(Address: Pointer; Strict: Boolean = False): Boolean;
 var
   Index:  Integer;
@@ -617,7 +893,7 @@ If (PtrUInt(Address) >= PtrUInt(fLowAddress)) and (PtrUInt(Address) < PtrUInt(fH
         Index := Integer((PtrUInt(Address) - PtrUInt(fLowAddress)) div PtrUInt(fReservedBlockSize));
         If CheckIndex(Index) then
           // check whether the address is within the block size (NOT reserved block size)
-          Result := (PtrUInt(Address) - PtrUInt(PtrAdvance(fLowAddress,Index,fReservedBlockSize))) < fBlockSize;
+          Result := (PtrUInt(Address) - PtrUInt(PtrAdvance(fLowAddress,Index,fReservedBlockSize))) < fSettings.BlockSize;
       end
     else Result := True;
   end;
@@ -636,7 +912,7 @@ If (PtrUInt(Address) >= PtrUInt(fLowAddress)) and (PtrUInt(Address) < PtrUInt(fH
   begin
     Index := Integer((PtrUInt(Address) - PtrUInt(fLowAddress)) div PtrUInt(fReservedBlockSize));
     If CheckIndex(Index) then
-      If not Strict or ((PtrUInt(Address) - PtrUInt(PtrAdvance(fLowAddress,Index,fReservedBlockSize))) < fBlockSize) then
+      If not Strict or ((PtrUInt(Address) - PtrUInt(PtrAdvance(fLowAddress,Index,fReservedBlockSize))) < fSettings.BlockSize) then
         Result := Index;
   end;
 {$IFDEF FPCDWM}{$POP}{$ENDIF}
@@ -719,35 +995,40 @@ end;
 
 //------------------------------------------------------------------------------
 
-Function TMBASegment.CanAllocateBlockVector(VectorLength: Integer): Boolean;
+Function TMBASegment.CanAllocateBuffer(BufferSize: TMemSize): Boolean;
 var
-  ReqBlockCount:  Integer;
+  RequiredBlockCount: Integer;
 begin
-Result := CheckIndex(FindSpaceForVector(VectorLength,ReqBlockCount));
+Result := CheckIndex(FindSpaceForBuffer(BufferSize,RequiredBlockCount));
 end;
 
 //------------------------------------------------------------------------------
 
-Function TMBASegment.TryAllocateBlockVector(out Vector: Pointer; VectorLength: Integer; InitMemory: Boolean): Boolean;
+Function TMBASegment.TryAllocateBuffer(out Buffer: Pointer; BufferSize: TMemSize; InitMemory: Boolean): Boolean;
 var
-  ReqBlockCount:  Integer;
-  Index,i:        Integer;
+  RequiredBlockCount: Integer;
+  Index,i:            Integer;
 begin
 Result := False;
-If VectorLength > 0 then
+If BufferSize > 0 then
   begin
-    Index := FindSpaceForVector(VectorLength,ReqBlockCount);
-    If CheckIndex(Index) and (ReqBlockCount > 0) then
+    Index := FindSpaceForBuffer(BufferSize,RequiredBlockCount);
+    If CheckIndex(Index) and (RequiredBlockCount > 0) then
       begin
-        // let's be super paranoid...
-        For i := Index to Pred(Index + ReqBlockCount) do
+      {
+        Let's be super paranoid and check whether FindSpaceForBuffer returned
+        valid data.
+      }
+        For i := Index to Pred(Index + RequiredBlockCount) do
           If fAllocationMap[i] then
             Exit;
-         For i := Index to Pred(Index + ReqBlockCount) do
+        // mark all blocks as allocated
+        For i := Index to Pred(Index + RequiredBlockCount) do
           fAllocationMap[i] := True;
-        Vector := PtrAdvance(fLowAddress,Index,fReservedBlockSize);
+        // get the actual allocation
+        Buffer := PtrAdvance(fLowAddress,Index,fReservedBlockSize);
         If InitMemory then
-          FillChar(Vector^,TMemSize(ReqBlockCount) * fReservedBlockSize,0);
+          FillChar(Buffer^,TMemSize(RequiredBlockCount) * fReservedBlockSize,0);
         Result := True;
       end;
   end;
@@ -755,44 +1036,44 @@ end;
 
 //------------------------------------------------------------------------------
 
-procedure TMBASegment.AllocateBlockVector(out Vector: Pointer; VectorLength: Integer; InitMemory: Boolean);
+procedure TMBASegment.AllocateBuffer(out Buffer: Pointer; BufferSize: TMemSize; InitMemory: Boolean);
 begin
-If VectorLength > 0 then
+If BufferSize > 0 then
   begin
-    If not TryAllocateBlockVector(Vector,VectorLength,InitMemory) then
-      raise EMBAOutOfResources.CreateFmt('TMBASegment.AllocateBlockVector: Unable to allocate vector of length %d.',[VectorLength]);
+    If not TryAllocateBuffer(Buffer,BufferSize,InitMemory) then
+      raise EMBAOutOfResources.CreateFmt('TMBASegment.AllocateBuffer: Unable to allocate buffer of size %u.',[PtrInt(BufferSize)]);
   end
-else raise EMBAInvalidValue.CreateFmt('TMBASegment.AllocateBlockVector: Invalid vector length (%d).',[VectorLength]);
+else raise EMBAInvalidValue.CreateFmt('TMBASegment.AllocateBuffer: Invalid buffer size (%u).',[PtrInt(BufferSize)]);
 end;
 
 //------------------------------------------------------------------------------
 
-procedure TMBASegment.FreeBlockVector(var Vector: Pointer; VectorLength: Integer);
+procedure TMBASegment.FreeBuffer(var Buffer: Pointer; BufferSize: TMemSize);
 var
-  ReqBlockCount:  Integer;
-  Index,i:        Integer;
+  RequiredBlockCount: Integer;
+  Index,i:            Integer;
 begin
-If VectorLength > 0 then
+If BufferSize > 0 then
   begin
-    Index := BlockIndexOf(Vector);
+    Index := BlockIndexOf(Buffer);
     If CheckIndex(Index) then
       begin
-        // check if the vector is really allocated in full length
-        ReqBlockCount := Ceil((TMemSize(VectorLength) * fBlockSize) / fReservedBlockSize);
-        If ReqBlockCount <= (fBlockCount - Index) then
+        RequiredBlockCount := BufferBlockCount(BufferSize);
+        If RequiredBlockCount <= (fBlockCount - Index) then
           begin
-            For i := Index to Pred(Index + ReqBlockCount) do
+            // check if the buffer is really allocated in full length
+            For i := Index to Pred(Index + RequiredBlockCount) do
               If not fAllocationMap[i] then
-                raise EMBAInvalidState.CreateFmt('TMBASegment.FreeBlockVector: Block %d not allocated.',[i]);
-            For i := Index to Pred(Index + ReqBlockCount) do
+                raise EMBAInvalidState.CreateFmt('TMBASegment.FreeBuffer: Block %d not allocated.',[i]);
+            For i := Index to Pred(Index + RequiredBlockCount) do
               fAllocationMap[i] := False;
-            Vector := nil;
+            Buffer := nil;
           end
-        else raise EMBAInvalidValue.CreateFmt('TMBASegment.FreeBlockVector: Vector too long (%d(%d)).',[VectorLength,ReqBlockCount]);
+        else raise EMBAInvalidValue.CreateFmt('TMBASegment.FreeBuffer: Buffer too large (%u).',[PtrInt(BufferSize)]);
       end
-    else raise EMBAInvalidAddress.CreateFmt('TMBASegment.FreeBlockVector: Invalid address (%p).',[Vector]);
+    else raise EMBAInvalidAddress.CreateFmt('TMBASegment.FreeBuffer: Invalid address (%p).',[Buffer]);
   end
-else raise EMBAInvalidValue.CreateFmt('TMBASegment.FreeBlockVector: Invalid vector length (%d).',[VectorLength]);
+else raise EMBAInvalidValue.CreateFmt('TMBASegment.FreeBuffer: Invalid buffer size (%u).',[PtrInt(BufferSize)]);
 end;
 
 //------------------------------------------------------------------------------
@@ -834,26 +1115,26 @@ end;
 
 Function TMBASegment.BlocksMemory: TMemSize;
 begin
-Result := TMemSize(fBlockCount) * fBlockSize;
+Result := TMemSize(fBlockCount) * fSettings.BlockSize;
 end;
 
 //------------------------------------------------------------------------------
 
 Function TMBASegment.AllocatedMemory: TMemSize;
 begin
-Result := TMemSize(AllocatedBlockCount) * fBlockSize;
+Result := TMemSize(AllocatedBlockCount) * fSettings.BlockSize;
 end;
 
 //------------------------------------------------------------------------------
 
 Function TMBASegment.WastedMemory: TMemSize;
 begin
-Result := fMemorySize - BlocksMemory - fAllocationMap.MemorySize;
+Result := fMemorySize - BlocksMemory - uIfThen(fSettings.MapInSegment,fAllocationMap.MemorySize,0);
 end;
 
 //------------------------------------------------------------------------------
 
-Function TMBASegment.MemoryEffeciency: Double;
+Function TMBASegment.MemoryEfficiency: Double;
 begin
 If fMemorySize <> 0 then
   Result := (fMemorySize - WastedMemory) / fMemorySize
@@ -874,58 +1155,142 @@ end;
 
 {===============================================================================
 --------------------------------------------------------------------------------
-                              TMassBlockAllocNoLock
+                               TMBAAsyncFillThread
 --------------------------------------------------------------------------------
 ===============================================================================}
 {===============================================================================
-    TMassBlockAllocNoLock - class implementation
+    TMBAAsyncFillThread - class declaration
+===============================================================================}
+type
+  TMBAAsyncFillThread = class(TThread)
+  protected
+    fAllocator:     TMassBlockAlloc;
+    fTimeout:       UInt32;
+    fCycleEvent:    TEvent;
+    fTerminateFlag: Integer;
+    procedure Execute; override;
+  public
+    constructor Create(Allocator: TMassBlockAlloc);
+    procedure Terminate; virtual; // hides inherited static method
+  end;
+
+{===============================================================================
+    TMBAAsyncFillThread - class implementation
 ===============================================================================}
 {-------------------------------------------------------------------------------
-    TMassBlockAllocNoLock - protected methods
+    TMBAAsyncFillThread - protected methods
 -------------------------------------------------------------------------------}
 
-Function TMassBlockAllocNoLock.GetSegment(Index: Integer): TMBASegment;
+procedure TMBAAsyncFillThread.Execute;
 begin
-If CheckIndex(Index) then
-  Result := fSegments[Index]
-else
-  raise EMBAIndexOutOfBounds.CreateFmt('TMassBlockAllocNoLock.GetSegment: Index (%d) out of bounds.',[Index]);
+while InterlockedExchangeAdd(fTerminateFlag,0) = 0 do
+  If fCycleEvent.WaitFor(fTimeout) <> wrError then
+    begin
+      fAllocator.ThreadLockAcquire;
+      try
+        fAllocator.InternalCacheFill(True);
+      finally
+        fAllocator.ThreadLockRelease;
+      end;
+    end;
+end;
+
+{-------------------------------------------------------------------------------
+    TMBAAsyncFillThread - public methods
+-------------------------------------------------------------------------------}
+
+constructor TMBAAsyncFillThread.Create(Allocator: TMassBlockAlloc);
+begin
+inherited Create(False);
+FreeOnTerminate := False;
+fAllocator := Allocator;
+fTimeout := fAllocator.Settings.CacheSettings.AsynchronousFill.CycleLength;
+fCycleEvent := fAllocator.fCache.AsyncFill.CycleEvent;
+fTerminateFlag := 0;
 end;
 
 //------------------------------------------------------------------------------
 
-Function TMassBlockAllocNoLock.GetCapacity: Integer;
+procedure TMBAAsyncFillThread.Terminate;
 begin
-Result := Length(fSegments);
+InterlockedIncrement(fTerminateFlag);
+end;
+
+{===============================================================================
+--------------------------------------------------------------------------------
+                                 TMassBlockAlloc                                                                  
+--------------------------------------------------------------------------------
+===============================================================================}
+{===============================================================================
+    TMassBlockAlloc - class implementation
+===============================================================================}
+{-------------------------------------------------------------------------------
+    TMassBlockAlloc - protected methods
+-------------------------------------------------------------------------------}
+
+Function TMassBlockAlloc.GetSegment(Index: Integer): TMBASegment;
+begin
+Result := nil;
+ThreadLockAcquire;
+try
+  If CheckIndex(Index) then
+    Result := fSegments[Index]
+  else
+    raise EMBAIndexOutOfBounds.CreateFmt('TMassBlockAlloc.GetSegment: Index (%d) out of bounds.',[Index]);
+finally
+  ThreadLockRelease;
+end;
 end;
 
 //------------------------------------------------------------------------------
 
-procedure TMassBlockAllocNoLock.SetCapacity(Value: Integer);
+Function TMassBlockAlloc.GetCapacity: Integer;
+begin
+ThreadLockAcquire;
+try
+  Result := Length(fSegments);
+finally
+  ThreadLockRelease;
+end;
+end;
+
+//------------------------------------------------------------------------------
+
+procedure TMassBlockAlloc.SetCapacity(Value: Integer);
 begin
 If Value >= 0 then
   begin
-    If Value <> Length(fSegments) then
-      begin
-        If Value < fSegmentCount then
-          raise EMBAInvalidAction.Create('TMassBlockAllocNoLock.SetCapacity: Cannot lower capacity below count.');
-        SetLength(fSegments,Value);
-      end;
+    ThreadLockAcquire;
+    try
+      If Value <> Length(fSegments) then
+        begin
+          If Value < fSegmentCount then
+            raise EMBAInvalidAction.Create('TMassBlockAlloc.SetCapacity: Cannot lower capacity below count.');
+          SetLength(fSegments,Value);
+        end;
+    finally
+      ThreadLockRelease;
+    end;
   end
-else raise EMBAInvalidValue.CreateFmt('TMassBlockAllocNoLock.SetCapacity: Invalid capacity (%d).',[Value]);
+else raise EMBAInvalidValue.CreateFmt('TMassBlockAlloc.SetCapacity: Invalid capacity (%d).',[Value]);
 end;
 
 //------------------------------------------------------------------------------
 
-Function TMassBlockAllocNoLock.GetCount: Integer;
+Function TMassBlockAlloc.GetCount: Integer;
 begin
-Result := fSegmentCount;
+ThreadLockAcquire;
+try
+  Result := fSegmentCount;
+finally
+  ThreadLockRelease;
+end;
 end;
 
 //------------------------------------------------------------------------------
 
 {$IFDEF FPCDWM}{$PUSH}W5024{$ENDIF}
-procedure TMassBlockAllocNoLock.SetCount(Value: Integer);
+procedure TMassBlockAlloc.SetCount(Value: Integer);
 begin
 // do nothing
 end;
@@ -933,17 +1298,17 @@ end;
 
 //------------------------------------------------------------------------------
 
-Function TMassBlockAllocNoLock.AddSegment: Integer;
+Function TMassBlockAlloc.AddSegment: Integer;
 begin
 Grow;
 Result := fSegmentCount;
-fSegments[Result] := TMBASegment.Create(fBlockSize,fMinBlocksPerSegment,fMemoryAlignment);
+fSegments[Result] := TMBASegment.Create(fSettings.SegmentSettings);
 Inc(fSegmentCount);
 end;
 
 //------------------------------------------------------------------------------
 
-procedure TMassBlockAllocNoLock.DeleteSegment(Index: Integer);
+procedure TMassBlockAlloc.DeleteSegment(Index: Integer);
 var
   i:  Integer;
 begin
@@ -956,12 +1321,12 @@ If CheckIndex(Index) then
     Dec(fSegmentCount);
     Shrink;
   end
-else raise EMBAIndexOutOfBounds.CreateFmt('TMassBlockAllocNoLock.DeleteSegment: Index (%d) out of bounds.',[Index]);
+else raise EMBAIndexOutOfBounds.CreateFmt('TMassBlockAlloc.DeleteSegment: Index (%d) out of bounds.',[Index]);
 end;
 
 //------------------------------------------------------------------------------
 
-procedure TMassBlockAllocNoLock.ClearSegments;
+procedure TMassBlockAlloc.ClearSegments;
 var
   i:  Integer;
 begin
@@ -973,55 +1338,238 @@ end;
 
 //------------------------------------------------------------------------------
 
-procedure TMassBlockAllocNoLock.Initialize(BlockSize: TMemSize; MinBlocksPerSegment: Integer; MemoryAlignment: TMemoryAlignment);
+procedure TMassBlockAlloc.Initialize(Settings: TMBAAllocatorSettings);
 begin
-fBlockSize := BlockSize;
-fMinBlocksPerSegment := MinBlocksPerSegment;
-fMemoryAlignment := MemoryAlignment;
-SetLength(fSegments,0);
+// first do settings sanity checks
+If Settings.CacheSettings.Enable and (Settings.CacheSettings.Length <= 0) then
+  raise EMBAInvalidValue.CreateFmt('TMassBlockAlloc.Initialize: Cache length too small (%d).',[Settings.CacheSettings.Length]);
+If (Settings.SegmentSettings.BlockSize <= 0) or (Settings.SegmentSettings.BlockSize > MBA_MAX_BLK_SZ) then
+  raise EMBAInvalidValue.CreateFmt('TMassBlockAlloc.Initialize: Invalid block size (%u).',[PtrInt(Settings.SegmentSettings.BlockSize)]);
+case Settings.SegmentSettings.SizingStyle of
+  szMinCount:
+    If Settings.SegmentSettings.BlockCount <= 0 then
+      raise EMBAInvalidValue.CreateFmt('TMassBlockAlloc.Initialize: Invalid block count (%d).',[Settings.SegmentSettings.BlockCount]);
+  szMinSize,
+  szExactSize:
+    If (Settings.SegmentSettings.MemorySize <= 0) or (Settings.SegmentSettings.MemorySize > MBA_MAX_SEG_SZ) then
+      raise EMBAInvalidValue.CreateFmt('TMassBlockAlloc.Initialize: Invalid memory size (%u).',[PtrInt(Settings.SegmentSettings.MemorySize)]);
+else
+  raise EMBAInvalidValue.CreateFmt('TMassBlockAlloc.Initialize: Unknown sizing style (%d).',[Ord(Settings.SegmentSettings.SizingStyle)]);
+end;
+fSettings := Settings;
+fSegments := nil;
 fSegmentCount := 0;
-fThreadLock := SyncObjs.TCriticalSection.Create;
+If fSettings.ThreadProtection then
+  fThreadLock := SyncObjs.TCriticalSection.Create
+else
+  fThreadLock := nil;
+// prepare cache
+FillChar(fCache,SizeOf(TMBACache),0);
+If fSettings.CacheSettings.Enable then
+  begin
+    fCache.Enabled := True;
+    SetLength(fCache.Data,fSettings.CacheSettings.Length * 2);
+    fCache.Count := 0;
+    InternalCacheFill(False);
+    If fSettings.CacheSettings.AsynchronousFill.Enable and fSettings.ThreadProtection then
+      begin
+        // prepare asynchronous filling
+        fCache.AsyncFill.Enabled := True;
+        fCache.AsyncFill.Interrupts := fSettings.CacheSettings.AsynchronousFill.Interruptable;
+        fCache.AsyncFill.InterruptFlag := 0;
+        fCache.AsyncFill.CycleEvent := TEvent.Create(nil,False,False,'');
+        fCache.AsyncFill.FillerThread := TMBAAsyncFillThread.Create(Self);
+      end;
+  end;
 end;
 
 //------------------------------------------------------------------------------
 
-procedure TMassBlockAllocNoLock.Finalize;
+procedure TMassBlockAlloc.Finalize;
+var
+  i:  Integer;
 begin
+If fCache.AsyncFill.Enabled then
+  begin
+    // finalize asynch filling
+    TMBAAsyncFillThread(fCache.AsyncFill.FillerThread).Terminate;
+    fCache.AsyncFill.CycleEvent.SetEvent;
+  {
+    We need to release the thread lock here, otherwise the filler thread can
+    enter a deadlock.
+  }
+    fCache.AsyncFill.FillerThread.WaitFor;
+    FreeAndNil(fCache.AsyncFill.FillerThread);
+    FreeAndNil(fCache.AsyncFill.CycleEvent);
+  end;
+// empty cache and free remaining segments
+ThreadLockAcquire;
+try
+  // there is no need to check whether cache is enabled
+  For i := Low(fCache.Data) to Pred(fCache.Count) do
+    InternalFreeBlock(fCache.Data[i]);
+  SetLength(fCache.Data,0);
+  ClearSegments;
+finally
+  ThreadLockRelease;
+end;
 FreeAndNil(fThreadLock);
-ClearSegments;
 end;
 
 //------------------------------------------------------------------------------
 
-procedure TMassBlockAllocNoLock.InternalLock;
+procedure TMassBlockAlloc.InternalAllocateBlock(out Block: Pointer; InitMemory: Boolean);
+var
+  i:  Integer;
 begin
-// do nothing
+// first try to allocate in existing segments
+For i := HighIndex downto LowIndex do
+  If not fSegments[i].IsFull then
+    begin
+      fSegments[i].AllocateBlock(Block,InitMemory);
+      Exit;
+    end;
+// no free block in existing segments, add new one
+fSegments[AddSegment].AllocateBlock(Block,InitMemory);
 end;
 
 //------------------------------------------------------------------------------
 
-procedure TMassBlockAllocNoLock.InternalUnlock;
+procedure TMassBlockAlloc.InternalFreeBlock(var Block: Pointer);
+var
+  i:  Integer;
 begin
-// do nothing
+For i := HighIndex downto LowIndex do
+  If fSegments[i].BlockOwned(Block) then
+    begin
+      fSegments[i].FreeBlock(Block);
+      If fSegments[i].IsEmpty and fSettings.FreeEmptySegments then
+        DeleteSegment(i);
+      Exit;
+    end;
+raise EMBAInvalidAddress.CreateFmt('TMassBlockAlloc.InternalFreeBlock: Unable to free block (%p).',[Block]);
+end;
+
+//------------------------------------------------------------------------------
+
+procedure TMassBlockAlloc.InternalAllocateBlocks(out Blocks: array of Pointer; InitMemory: Boolean);
+var
+  Index:  Integer;
+  i:      Integer;
+
+  procedure AllocateFromSegment(SegmentIndex: Integer);
+  begin
+    while (Index <= High(Blocks)) and not fSegments[SegmentIndex].IsFull do
+      begin
+        fSegments[SegmentIndex].AllocateBlock(Blocks[Index],InitMemory);
+        Inc(Index);
+      end;
+  end;
+
+begin
+Index := Low(Blocks);
+For i := HighIndex downto LowIndex do
+  begin
+    AllocateFromSegment(i);
+    If Index > High(Blocks) then
+      Exit;
+  end;
+while Index <= High(Blocks) do
+  AllocateFromSegment(AddSegment);
+end;
+
+//------------------------------------------------------------------------------
+
+procedure TMassBlockAlloc.InternalFreeBlocks(var Blocks: array of Pointer);
+var
+  Index,i:  Integer;
+  Counter:  Integer;
+begin
+Counter := Length(Blocks);
+For i := HighIndex downto LowIndex do
+  begin
+    For Index := Low(Blocks) to High(Blocks) do
+      If Assigned(Blocks[Index]) and fSegments[i].BlockOwned(Blocks[Index]) then
+        begin
+          fSegments[i].FreeBlock(Blocks[Index]);  // sets the pointer to nil
+          Dec(Counter);
+          If fSegments[i].IsEmpty then
+            begin
+              If fSettings.FreeEmptySegments then
+                DeleteSegment(i);
+              Break{For Index};
+            end;
+          If Counter <= 0 then
+            Exit;
+        end;
+  end;
+If Counter > 0 then
+  raise EMBAInvalidAddress.CreateFmt('TMassBlockAlloc.InternalFreeBlocks: Not all blocks were freed (%d).',[Counter]);
+end;
+
+//------------------------------------------------------------------------------
+
+Function TMassBlockAlloc.InternalCacheFill(AsyncFill: Boolean): Integer;
+var
+  i:  Integer;
+begin
+Result := 0;
+// thread lock must be acquired before calling this function
+If fCache.Count < (Length(fCache.Data) shr 1) then
+  begin
+    // cache is underfilled
+    For i := fCache.Count to Pred(Length(fCache.Data) div 2) do
+      begin
+        If AsyncFill and fCache.AsyncFill.Interrupts then
+          If InterlockedExchangeAdd(fCache.AsyncFill.InterruptFlag,0) <> 0 then
+            Exit; // interrupt filling
+        InternalAllocateBlock(fCache.Data[i],False);
+        Inc(fCache.Count);
+        Inc(Result);
+      end;
+  end
+else If fCache.Count > (Length(fCache.Data) shr 1) then
+  begin
+    // cache is overfilled
+    For i := Pred(fCache.Count) downto (Length(fCache.Data) div 2) do
+      begin
+        If AsyncFill and fCache.AsyncFill.Interrupts then
+          If InterlockedExchangeAdd(fCache.AsyncFill.InterruptFlag,0) <> 0 then
+            Exit;
+        InternalFreeBlock(fCache.Data[i]);
+        Dec(fCache.Count);
+        Dec(Result);
+      end;
+  end;
 end;
 
 {-------------------------------------------------------------------------------
-    TMassBlockAllocNoLock - public methods
+    TMassBlockAlloc - public methods
 -------------------------------------------------------------------------------}
 
-constructor TMassBlockAllocNoLock.Create(BlockSize: TMemSize; MinBlocksPerSegment: Integer; MemoryAlignment: TMemoryAlignment = maNone);
+constructor TMassBlockAlloc.Create(Settings: TMBAAllocatorSettings);
 begin
-If BlockSize <= 0 then
-  raise EMBAInvalidValue.CreateFmt('TMassBlockAllocNoLock.Create: Invalid block size (%d).',[BlockSize]);
-If MinBlocksPerSegment <= 0 then
-  raise EMBAInvalidValue.CreateFmt('TMassBlockAllocNoLock.Create: Invalid minimal blocks-per-segment count (%d).',[MinBlocksPerSegment]);
 inherited Create;
-Initialize(BlockSize,MinBlocksPerSegment,MemoryAlignment);
+Initialize(Settings);
+end;
+
+// - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+
+constructor TMassBlockAlloc.Create(BlockSize: TMemSize; MinBlocksPerSegment: Integer; MemoryAlignment: TMemoryAlignment = maNone);
+var
+  Settings: TMBAAllocatorSettings;
+begin
+Settings := DefaultAllocatorSettings;   
+Settings.SegmentSettings.BlockSize := BlockSize;
+Settings.SegmentSettings.Alignment := MemoryAlignment;
+Settings.SegmentSettings.SizingStyle := szMinCount;
+Settings.SegmentSettings.BlockCount := MinBlocksPerSegment;
+Create(Settings);
 end;
 
 //------------------------------------------------------------------------------
 
-destructor TMassBlockAllocNoLock.Destroy;
+destructor TMassBlockAlloc.Destroy;
 begin
 Finalize;
 inherited;
@@ -1029,484 +1577,301 @@ end;
 
 //------------------------------------------------------------------------------
 
-Function TMassBlockAllocNoLock.LowIndex: Integer;
+Function TMassBlockAlloc.LowIndex: Integer;
 begin
-Result := Low(fSegments);
+ThreadLockAcquire;
+try
+  Result := Low(fSegments);
+finally
+  ThreadLockRelease;
+end;
 end;
 
 //------------------------------------------------------------------------------
 
-Function TMassBlockAllocNoLock.HighIndex: Integer;
+Function TMassBlockAlloc.HighIndex: Integer;
 begin
-Result := Pred(fSegmentCount);
+ThreadLockAcquire;
+try
+  Result := Pred(fSegmentCount);
+finally
+  ThreadLockRelease;
+end;
 end;
 
 //------------------------------------------------------------------------------
 
-procedure TMassBlockAllocNoLock.Lock;
+procedure TMassBlockAlloc.ThreadLockAcquire;
 begin
-fThreadLock.Enter;
+If Assigned(fThreadLock) then
+  fThreadLock.Enter;
 end;
 
 //------------------------------------------------------------------------------
 
-procedure TMassBlockAllocNoLock.Unlock;
+procedure TMassBlockAlloc.ThreadLockRelease;
 begin
-fThreadLock.Leave;
+If Assigned(fThreadLock) then
+  fThreadLock.Leave;
 end;
 
 //------------------------------------------------------------------------------
 
-Function TMassBlockAllocNoLock.AllocateBlock(InitMemory: Boolean = False): Pointer;
+procedure TMassBlockAlloc.AllocationAcquire;
+begin
+If Assigned(fThreadLock) then
+  begin
+    If fCache.AsyncFill.Interrupts then
+      InterlockedIncrement(fCache.AsyncFill.InterruptFlag);
+    fThreadLock.Enter;
+  end;
+end;
+
+
+//------------------------------------------------------------------------------
+
+procedure TMassBlockAlloc.AllocationRelease;
+begin
+If Assigned(fThreadLock) then
+  begin
+    fThreadLock.Leave;
+    If fCache.AsyncFill.Interrupts then
+      InterlockedDecrement(fCache.AsyncFill.InterruptFlag);
+  end;
+end;
+
+//------------------------------------------------------------------------------
+
+procedure TMassBlockAlloc.AllocateBlock(out Block: Pointer; InitMemory: Boolean = False);
+begin
+AllocationAcquire;
+try
+  InternalAllocateBlock(Block,InitMemory);
+finally
+  AllocationRelease;
+end;
+end;
+
+// - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+
+Function TMassBlockAlloc.AllocateBlock(InitMemory: Boolean = False): Pointer;
 begin
 AllocateBlock(Result,InitMemory);
 end;
 
+//------------------------------------------------------------------------------
+
+procedure TMassBlockAlloc.FreeBlock(var Block: Pointer);
+begin
+AllocationAcquire;
+try
+  InternalFreeBlock(Block);
+finally
+  AllocationRelease;
+end;
+end;
+
+//------------------------------------------------------------------------------
+
+procedure TMassBlockAlloc.AllocateBlocks(out Blocks: array of Pointer; InitMemory: Boolean = False);
+begin
+If Length(Blocks) > 0 then
+  begin
+    AllocationAcquire;
+    try
+      InternalAllocateBlocks(Blocks,InitMemory);
+    finally
+      AllocationRelease;
+    end;
+  end;    
+end;
+
+//------------------------------------------------------------------------------
+
+procedure TMassBlockAlloc.FreeBlocks(var Blocks: array of Pointer);
+begin
+If Length(Blocks) > 0 then
+  begin
+    AllocationAcquire;
+    try
+      InternalFreeBlocks(Blocks);
+    finally
+      AllocationRelease;
+    end;
+  end;    
+end;
+
+//------------------------------------------------------------------------------
+
+procedure TMassBlockAlloc.AllocateBuffer(out Buffer: Pointer; BufferSize: TMemSize; InitMemory: Boolean = False);
+var
+  i:  Integer;
+begin
+If BufferSize > 0 then
+  begin
+    AllocationAcquire;
+    try
+      // we need at least one segment to exist for checks
+      If fSegmentCount <= 0 then
+        AddSegment;
+      If fSegments[LowIndex].BufferBlockCount(BufferSize) > fSegments[LowIndex].BlockCount then
+        raise EMBAOutOfResources.CreateFmt('TMassBlockAlloc.AllocateBuffer: Buffer is too large (%u).',[PtrInt(BufferSize)]);
+      // try to alocate it somewhere
+      For i := HighIndex downto LowIndex do
+        If fSegments[i].TryAllocateBuffer(Buffer,BufferSize,InitMemory) then
+          Exit;
+      // buffer not allocated in existing segments, add a new one and allocate there
+      fSegments[AddSegment].AllocateBuffer(Buffer,BufferSize,InitMemory);
+    finally
+      AllocationRelease;
+    end;
+  end
+else raise EMBAInvalidValue.CreateFmt('TMassBlockAlloc.AllocateBuffer: Invalid buffer size (%u).',[PtrInt(BufferSize)]);
+end;
+
+//------------------------------------------------------------------------------
+
+procedure TMassBlockAlloc.FreeBuffer(var Buffer: Pointer; BufferSize: TMemSize);
+var
+  i:  Integer;
+begin
+If BufferSize > 0 then
+  begin
+    AllocationAcquire;
+    try
+      // note that buffer size is checked by the segment (FreeBuffer)
+      For i := HighIndex downto LowIndex do
+        If fSegments[i].BlockOwned(Buffer) then
+          begin
+            fSegments[i].FreeBuffer(Buffer,BufferSize);
+            If fSegments[i].IsEmpty and fSettings.FreeEmptySegments then
+              DeleteSegment(i);
+            Exit;
+          end;
+      raise EMBAInvalidAddress.CreateFmt('TMassBlockAlloc.FreeBuffer: Unable to free buffer (%p).',[Buffer]);
+    finally
+      AllocationRelease;
+    end;
+  end
+else raise EMBAInvalidValue.CreateFmt('TMassBlockAlloc.FreeBuffer: Invalid buffer size (%u).',[PtrInt(BufferSize)]);
+end;
+
+//------------------------------------------------------------------------------
+
+procedure TMassBlockAlloc.AllocateBlockVector(out Vector: Pointer; VectorLength: Integer; InitMemory: Boolean = False);
+begin
+If VectorLength > 0 then
+  AllocateBuffer(Vector,TMemSize(VectorLength) * fSettings.SegmentSettings.BlockSize,InitMemory)
+else
+  raise EMBAInvalidValue.CreateFmt('TMassBlockAlloc.AllocateBlockVector: Invalid vector length (%d).',[VectorLength]);
+end;
+
+//------------------------------------------------------------------------------
+
+procedure TMassBlockAlloc.FreeBlockVector(var Vector: Pointer; VectorLength: Integer);
+begin
+If VectorLength > 0 then
+  FreeBuffer(Vector,TMemSize(VectorLength) * fSettings.SegmentSettings.BlockSize)
+else
+  raise EMBAInvalidValue.CreateFmt('TMassBlockAlloc.FreeBlockVector: Invalid vector length (%d).',[VectorLength]);
+end;
+
+//------------------------------------------------------------------------------
+
+Function TMassBlockAlloc.CacheCount: Integer;
+begin
+ThreadLockAcquire;
+try
+  Result := fCache.Count;
+finally
+  ThreadLockRelease;
+end;
+end;
+
+//------------------------------------------------------------------------------
+
+procedure TMassBlockAlloc.CacheFill(ForceSynchronous: Boolean = False);
+begin
+If fCache.Enabled then
+  begin
+    If ForceSynchronous or not fCache.AsyncFill.Enabled then
+      begin
+        ThreadLockAcquire;
+        try
+          InternalCacheFill(False);
+        finally
+          ThreadLockRelease;
+        end;
+      end
+    else fCache.AsyncFill.CycleEvent.SetEvent;
+  end;
+end;
+
+//------------------------------------------------------------------------------
+
+procedure TMassBlockAlloc.CacheAllocateBlock(out Block: Pointer; InitMemory: Boolean = False);
+begin
+AllocationAcquire;
+try
+  If fCache.Count > 0 then
+    begin
+      Block := fCache.Data[Pred(fCache.Count)];
+      fCache.Data[Pred(fCache.Count)] := nil;
+      Dec(fCache.Count);
+      If InitMemory then
+        FillChar(Block^,fSegments[LowIndex].ReservedBlockSize,0);
+    end
+  else InternalAllocateBlock(Block,InitMemory);
+finally
+  AllocationRelease;
+end;
+end;
+
 // - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
 
-procedure TMassBlockAllocNoLock.AllocateBlock(out Block: Pointer; InitMemory: Boolean = False);
-var
-  i:  Integer;
-begin
-InternalLock;
-try
-  // first try to allocate in existing segments
-  For i := LowIndex to HighIndex do
-    If not fSegments[i].IsFull then
-      begin
-        fSegments[i].AllocateBlock(Block,InitMemory);
-        Exit;
-      end;
-  // no free block in existing segments, add new one
-  fSegments[AddSegment].AllocateBlock(Block,InitMemory);
-finally
-  InternalUnlock;
-end;
-end;
-
-//------------------------------------------------------------------------------
-
-procedure TMassBlockAllocNoLock.AllocateBlocks(out Blocks: array of Pointer; InitMemory: Boolean = False);
-var
-  Index:  Integer;
-  i:      Integer;
-begin
-If Length(Blocks) > 0 then
-  begin
-    InternalLock;
-    try
-      Index := Low(Blocks);
-      For i := LowIndex to HighIndex do
-        while not fSegments[i].IsFull do
-          begin
-            fSegments[i].AllocateBlock(Blocks[Index],InitMemory);
-            If Index < High(Blocks) then
-              Inc(Index)
-            else
-              Exit;
-          end;
-      while Index <= High(Blocks) do
-        begin
-          i := AddSegment;
-          while not fSegments[i].IsFull do
-            begin
-              fSegments[i].AllocateBlock(Blocks[Index],InitMemory);
-              If Index < High(Blocks) then
-                Inc(Index)
-              else
-                Exit;
-            end;
-        end;
-    finally
-      InternalUnlock;
-    end;
-  end;    
-end;
-
-//------------------------------------------------------------------------------
-
-procedure TMassBlockAllocNoLock.AllocateBlockVector(out Vector: Pointer; VectorLength: Integer; InitMemory: Boolean = False);
-var
-  i:  Integer;
-begin
-If VectorLength > 0 then
-  begin
-    InternalLock;
-    try
-      // check whether the vector can fit into any segment
-      If TMBASegment.CalculateVectorReqBlockCount(fBlockSize,VectorLength,fMemoryAlignment) <= BlocksPerSegment then
-        begin
-          For i := LowIndex to HighIndex do
-            If fSegments[i].TryAllocateBlockVector(Vector,VectorLength,InitMemory) then
-              Exit;
-          // vector not allocated in existing segments, add a new one and allocate there
-          fSegments[AddSegment].AllocateBlockVector(Vector,VectorLength,InitMemory);
-        end
-      else raise EMBAOutOfResources.CreateFmt('TMassBlockAllocNoLock.AllocateBlockVector: Vector is too long (%d).',[VectorLength]);
-    finally
-      InternalUnlock;
-    end;
-  end
-else raise EMBAInvalidValue.CreateFmt('TMassBlockAllocNoLock.AllocateBlockVector: Invalid vector length (%d).',[VectorLength]);
-end;
-
-//------------------------------------------------------------------------------
-
-procedure TMassBlockAllocNoLock.FreeBlock(var Block: Pointer);
-var
-  i:  Integer;
-begin
-InternalLock;
-try
-  For i := HighIndex downto LowIndex do
-    If fSegments[i].BlockOwned(Block) then
-      begin
-        fSegments[i].FreeBlock(Block);
-        If fSegments[i].IsEmpty then
-          DeleteSegment(i);
-        Exit;
-      end;
-  raise EMBAInvalidAddress.CreateFmt('TMassBlockAllocNoLock.FreeBlock: Unable to free block (%p).',[Block]);
-finally
-  InternalUnlock;
-end;
-end;
-
-//------------------------------------------------------------------------------
-
-procedure TMassBlockAllocNoLock.FreeBlocks(var Blocks: array of Pointer);
-var
-  Index,i:  Integer;
-  Counter:  Integer;
-begin
-If Length(Blocks) > 0 then
-  begin
-    InternalLock;
-    try
-      Counter := Length(Blocks);
-      For i := HighIndex downto LowIndex do
-        begin
-          For Index := Low(Blocks) to High(Blocks) do
-            If Assigned(Blocks[Index]) and fSegments[i].BlockOwned(Blocks[Index]) then
-              begin
-                fSegments[i].FreeBlock(Blocks[Index]);
-                Dec(Counter);
-                If Counter <= 0 then
-                  begin
-                    If fSegments[i].IsEmpty then
-                      DeleteSegment(i);
-                    Exit;
-                  end
-              end;
-          If fSegments[i].IsEmpty then
-            DeleteSegment(i);
-        end;
-      If Counter > 0 then
-        raise EMBAInvalidAddress.CreateFmt('TMassBlockAllocNoLock.FreeBlocks: Not all blocks were freed (%d).',[Counter]);
-    finally
-      InternalUnlock;
-    end;
-  end;    
-end;
-
-//------------------------------------------------------------------------------
-
-procedure TMassBlockAllocNoLock.FreeBlockVector(var Vector: Pointer; VectorLength: Integer);
-var
-  i:  Integer;
-begin
-If VectorLength > 0 then
-  begin
-    InternalLock;
-    try
-      If TMBASegment.CalculateVectorReqBlockCount(fBlockSize,VectorLength,fMemoryAlignment) <= BlocksPerSegment then
-        begin
-          For i := HighIndex downto LowIndex do
-            If fSegments[i].BlockOwned(Vector) then
-              begin
-                fSegments[i].FreeBlockVector(Vector,VectorLength);
-                If fSegments[i].IsEmpty then
-                  DeleteSegment(i);
-                Exit;
-              end;
-          raise EMBAInvalidAddress.CreateFmt('TMassBlockAllocNoLock.FreeBlockVector: Unable to free vector (%p).',[Vector]);
-        end
-      else raise EMBAOutOfResources.CreateFmt('TMassBlockAllocNoLock.FreeBlockVector: Vector is too long (%d).',[VectorLength]);
-    finally
-      InternalUnlock;
-    end;
-  end
-else raise EMBAInvalidValue.CreateFmt('TMassBlockAllocNoLock.FreeBlockVector: Invalid vector length (%d).',[VectorLength]);
-end;
-
-//------------------------------------------------------------------------------
-
-Function TMassBlockAllocNoLock.SegmentSize: TMemSize;
-begin
-InternalLock;
-try
-  If fSegmentCount > 0 then
-    Result := fSegments[LowIndex].MemorySize
-  else
-    Result := TMBASegment.CalculateMemorySize(fBlockSize,fMinBlocksPerSegment,fMemoryAlignment);
-finally
-  InternalUnlock;
-end;
-end;
-
-//------------------------------------------------------------------------------
-
-Function TMassBlockAllocNoLock.BlocksPerSegment: Integer;
-begin
-InternalLock;
-try
-  If fSegmentCount > 0 then
-    Result := fSegments[LowIndex].BlockCount
-  else
-    Result := TMBASegment.CalculateBlockCount(fBlockSize,fMinBlocksPerSegment,fMemoryAlignment);
-finally
-  InternalUnlock;
-end;
-end;
-
-//------------------------------------------------------------------------------
-
-Function TMassBlockAllocNoLock.AllocatedBlockCount: Integer;
-var
-  i:  Integer;
-begin
-InternalLock;
-try
-  Result := 0;
-  For i := LowIndex to HighIndex do
-    Inc(Result,fSegments[i].AllocatedBlockCount);
-finally
-  InternalUnlock;
-end;
-end;
-
-//------------------------------------------------------------------------------
-
-Function TMassBlockAllocNoLock.FreeBlockCount: Integer;
-var
-  i:  Integer;
-begin
-InternalLock;
-try
-  Result := 0;
-  For i := LowIndex to HighIndex do
-    Inc(Result,fSegments[i].FreeBlockCount);
-finally
-  InternalUnlock;
-end;
-end;
-
-//------------------------------------------------------------------------------
-
-Function TMassBlockAllocNoLock.TotalReservedMemory: TMemSize;
-var
-  i:  Integer;
-begin
-InternalLock;
-try
-  Result := 0;
-  For i := LowIndex to HighIndex do
-    Inc(Result,fSegments[i].ReservedMemory);
-finally
-  InternalUnlock;
-end;
-end;
-
-//------------------------------------------------------------------------------
-
-Function TMassBlockAllocNoLock.TotalBlocksMemory: TMemSize;
-var
-  i:  Integer;
-begin
-InternalLock;
-try
-  Result := 0;
-  For i := LowIndex to HighIndex do
-    Inc(Result,fSegments[i].BlocksMemory);
-finally
-  InternalUnlock;
-end;
-end;
-
-//------------------------------------------------------------------------------
-
-Function TMassBlockAllocNoLock.TotalAllocatedMemory: TMemSize;
-var
-  i:  Integer;
-begin
-InternalLock;
-try
-  Result := 0;
-  For i := LowIndex to HighIndex do
-    Inc(Result,fSegments[i].AllocatedMemory);
-finally
-  InternalUnlock;
-end;
-end;
-
-//------------------------------------------------------------------------------
-
-Function TMassBlockAllocNoLock.TotalWastedMemory: TMemSize;
-var
-  i:  Integer;
-begin
-InternalLock;
-try
-  Result := 0;
-  For i := LowIndex to HighIndex do
-    Inc(Result,fSegments[i].WastedMemory);
-finally
-  InternalUnlock;
-end;
-end;
-
-//------------------------------------------------------------------------------
-
-Function TMassBlockAllocNoLock.TotalMemorySize: TMemSize;
-var
-  i:  Integer;
-begin
-InternalLock;
-try
-  Result := 0;
-  For i := LowIndex to HighIndex do
-    Inc(Result,fSegments[i].MemorySize);
-finally
-  InternalUnlock;
-end;
-end;
-
-//------------------------------------------------------------------------------
-
-Function TMassBlockAllocNoLock.MemoryEffeciency: Double;
-var
-  MemorySize: TMemSize;
-begin
-InternalLock;
-try
-  MemorySize := TotalMemorySize;
-  If MemorySize <> 0 then
-    Result := (MemorySize - TotalWastedMemory) / MemorySize
-  else
-    Result := 0.0;
-finally
-  InternalUnlock;
-end;
-end;
-
-//------------------------------------------------------------------------------
-
-Function TMassBlockAllocNoLock.MemoryUtilization: Double;
-var
-  BlocksMemory: TMemSize;
-begin
-InternalLock;
-try
-  BlocksMemory := TotalBlocksMemory;
-  If BlocksMemory <> 0 then
-    Result := TotalAllocatedMemory / BlocksMemory
-  else
-    Result := 0.0;
-finally
-  InternalUnlock;
-end;
-end;
-
-
-{===============================================================================
---------------------------------------------------------------------------------
-                                 TMassBlockAlloc
---------------------------------------------------------------------------------
-===============================================================================}
-{===============================================================================
-    TMassBlockAlloc - class implementation
-===============================================================================}
-{-------------------------------------------------------------------------------
-    TMassBlockAlloc - protected methods
--------------------------------------------------------------------------------}
-
-procedure TMassBlockAlloc.InternalLock;
-begin
-fThreadLock.Enter;
-end;
-
-//------------------------------------------------------------------------------
-
-procedure TMassBlockAlloc.InternalUnlock;
-begin
-fThreadLock.Leave;
-end;
-
-
-{===============================================================================
---------------------------------------------------------------------------------
-                              TMassBlockAllocCached                                                            
---------------------------------------------------------------------------------
-===============================================================================}
-{===============================================================================
-    TMassBlockAllocCached - class implementation
-===============================================================================}
-{-------------------------------------------------------------------------------
-    TMassBlockAllocCached - protected methods
--------------------------------------------------------------------------------}
-
-procedure TMassBlockAllocCached.Initialize(BlockSize: TMemSize; MinBlocksPerSegment: Integer; MemoryAlignment: TMemoryAlignment = maNone);
-begin
-inherited Initialize(BlockSize,MinBlocksPerSegment,MemoryAlignment);
-SetLength(fCacheData,0);
-fCacheCount := 0;
-end;
-
-//------------------------------------------------------------------------------
-
-procedure TMassBlockAllocCached.Finalize;
-var
-  i:  Integer;
-begin
-// free cached blocks 
-For i := 0 to Pred(fCacheCount) do
-  FreeBlock(fCacheData[i]); 
-SetLength(fCacheData,0);
-inherited;
-end;
-
-{-------------------------------------------------------------------------------
-    TMassBlockAllocCached - public methods
--------------------------------------------------------------------------------}
-
-Function TMassBlockAllocCached.CacheAllocateBlock(InitMemory: Boolean = False): Pointer;
+Function TMassBlockAlloc.CacheAllocateBlock(InitMemory: Boolean = False): Pointer;
 begin
 CacheAllocateBlock(Result,InitMemory);
 end;
 
-// - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+//------------------------------------------------------------------------------
 
-procedure TMassBlockAllocCached.CacheAllocateBlock(out Block: Pointer; InitMemory: Boolean = False);
+procedure TMassBlockAlloc.CacheFreeBlock(var Block: Pointer);
+
+  Function CheckBlockValidity: Boolean;
+  var
+    i:  Integer;
+  begin
+    Result := False;
+    For i := LowIndex to HighIndex do
+      If fSegments[i].BlockOwned(Block) then
+        begin
+          Result := True;
+          Break{For ii};
+        end;
+  end;
+
 begin
-InternalLock;
+AllocationAcquire;
 try
-  If fCacheCount > 0 then
+  If fCache.Count < Length(fCache.Data) then
     begin
-      Block := fCacheData[Pred(fCacheCount)];
-      fCacheData[Pred(fCacheCount)] := nil;
-      Dec(fCacheCount);
-      If InitMemory then
-        FillChar(Block^,fSegments[LowIndex].ReservedBlockSize,0);
+      If not fSettings.CacheSettings.TrustedReturns then
+        If not CheckBlockValidity then
+          raise EMBAInvalidAddress.CreateFmt('TMassBlockAlloc.CacheFreeBlock: Invalid block address (%p).',[Block]); 
+      fCache.Data[fCache.Count] := Block;
+      Inc(fCache.Count);
+      Block := nil;
     end
-  else AllocateBlock(Block,InitMemory);
+  else InternalFreeBlock(Block);
 finally
-  InternalUnlock;
+  AllocationRelease;
 end;
 end;
 
 //------------------------------------------------------------------------------
 
-procedure TMassBlockAllocCached.CacheAllocateBlocks(out Blocks: array of Pointer; InitMemory: Boolean = False);
+procedure TMassBlockAlloc.CacheAllocateBlocks(out Blocks: array of Pointer; InitMemory: Boolean = False);
 var
   Index:      Integer;
   TempBlocks: array of Pointer;
@@ -1514,77 +1879,287 @@ var
 begin
 If Length(Blocks) > 0 then
   begin
-    InternalLock;
-    try
-      Index := Low(Blocks);
-      while fCacheCount > 0 do
-        begin
-          Blocks[Index] := fCacheData[Pred(fCacheCount)];
-          fCacheData[Pred(fCacheCount)] := nil;
-          Dec(fCacheCount);
-          If InitMemory then
-            FillChar(Blocks[Index]^,fSegments[LowIndex].ReservedBlockSize,0);
-          Inc(Index);
-          If Index > High(Blocks) then
-            Break{while};
+    If fCache.Enabled then
+      begin
+        AllocationAcquire;
+        try
+          Index := Low(Blocks);
+          while fCache.Count > 0 do
+            begin
+              Blocks[Index] := fCache.Data[Pred(fCache.Count)];
+              fCache.Data[Pred(fCache.Count)] := nil;
+              Dec(fCache.Count);
+              If InitMemory then
+                FillChar(Blocks[Index]^,fSegments[LowIndex].ReservedBlockSize,0);
+              Inc(Index);
+              If Index > High(Blocks) then
+                Break{while};
+            end;
+          If Index < High(Blocks) then
+            begin
+              // more than one block needs to be allocated
+              SetLength(TempBlocks,Length(Blocks) - Index);
+              InternalAllocateBlocks(TempBlocks,InitMemory);
+              For i := Low(TempBlocks) to High(TempBlocks) do
+                Blocks[Index + i] := TempBlocks[i];
+            end
+          else If Index = High(Blocks) then
+            // only one block needs to be allocated
+            InternalAllocateBlock(Blocks[Index],InitMemory);
+        finally
+          AllocationRelease;
         end;
-      If Index < High(Blocks) then
-        begin
-          // more than one block needs to be allocated
-          SetLength(TempBlocks,Length(Blocks) - Index);
-          AllocateBlocks(TempBlocks,InitMemory);
-          For i := Low(TempBlocks) to High(TempBlocks) do
-            Blocks[Index + i] := TempBlocks[i];
-        end
-      else If Index = High(Blocks) then
-        // only one block needs to be allocated
-        AllocateBlock(Blocks[Index],InitMemory);
-    finally
-      InternalUnlock;
-    end;
-  end;
+      end
+    else AllocateBlocks(Blocks,InitMemory);
+  end
 end;
 
 //------------------------------------------------------------------------------
 
-procedure TMassBlockAllocCached.CacheFill(Count: Integer = -1);
+procedure TMassBlockAlloc.CacheFreeBlocks(var Blocks: array of Pointer);
+
+  Function CheckBlocksValidity(out FaultIndex: Integer): Boolean;
+  var
+    i,j: Integer;
+  begin
+    Result := False;
+    FaultIndex := -1;
+    For i := Low(Blocks) to High(Blocks) do
+      begin
+        Result := False;
+        For j := LowIndex to HighIndex do
+          If fSegments[j].BlockOwned(Blocks[i]) then
+            begin
+              Result := True;
+              Break{For j};
+            end;
+        If not Result then
+          begin
+            FaultIndex := i;
+            Break{For i};
+          end;
+      end;
+  end;
+
+var
+  Index:      Integer;
+  TempBlocks: array of Pointer;
+  i:          Integer;
+begin
+If Length(Blocks) > 0 then
+  begin
+    If fCache.Enabled then
+      begin
+        AllocationAcquire;
+        try
+          If not fSettings.CacheSettings.TrustedReturns then
+            If not CheckBlocksValidity(Index) then
+              raise EMBAInvalidAddress.CreateFmt('TMassBlockAlloc.CacheFreeBlocks: Invalid block address (%p).',[Blocks[Index]]);
+          Index := Low(Blocks);
+          while fCache.Count < Length(fCache.Data) do
+            begin
+              fCache.Data[fCache.Count] := Blocks[Index];
+              Blocks[Index] := nil;
+              Inc(fCache.Count);
+              Inc(Index);
+              If Index > High(Blocks) then
+                Break{while};
+            end;
+          If Index < High(Blocks) then
+            begin
+              // several blocks needs to be freed
+              SetLength(TempBlocks,Length(Blocks) - Index);
+              For i := Low(TempBlocks) to High(TempBlocks) do
+                begin
+                  TempBlocks[i] := Blocks[Index + i];
+                  Blocks[Index + i] := nil;
+                end;
+              InternalFreeBlocks(TempBlocks);
+            end
+          else If Index = High(Blocks) then
+            // only one block needs to be freed
+            InternalFreeBlock(Blocks[Index]);
+        finally
+          AllocationRelease;
+        end;
+      end
+    else FreeBlocks(Blocks);
+  end
+end;
+
+//------------------------------------------------------------------------------
+
+Function TMassBlockAlloc.SegmentSize: TMemSize;
+begin
+ThreadLockAcquire;
+try
+  If fSegmentCount <= 0 then
+    AddSegment;
+  Result := fSegments[LowIndex].MemorySize;
+finally
+  ThreadLockRelease;
+end;
+end;
+
+//------------------------------------------------------------------------------
+
+Function TMassBlockAlloc.BlocksPerSegment: Integer;
+begin
+ThreadLockAcquire;
+try
+  If fSegmentCount <= 0 then
+    AddSegment;
+  Result := fSegments[LowIndex].BlockCount;
+finally
+  ThreadLockRelease;
+end;
+end;
+
+//------------------------------------------------------------------------------
+
+Function TMassBlockAlloc.AllocatedBlockCount: Integer;
 var
   i:  Integer;
 begin
-InternalLock;
+ThreadLockAcquire;
 try
-  If Count > 0 then
-    begin
-      // set capacity to selected count and fill the cache (if needed)
-      If Count < fCacheCount then
-        begin
-          For i := Count to Pred(fCacheCount) do
-            FreeBlock(fCacheData[i]);
-          fCacheCount := Count;
-        end;
-      If Count <> Length(fCacheData) then
-        SetLength(fCacheData,Count);
-      For i := fCacheCount to High(fCacheData) do
-        AllocateBlock(fCacheData[i],False);
-      fCacheCount := Length(fCacheData);
-    end
-  else If Count < 0 then
-    begin
-      // keep capacity and fill, if needed
-      For i := fCacheCount to High(fCacheData) do
-        AllocateBlock(fCacheData[i],False);
-      fCacheCount := Length(fCacheData);      
-    end
-  else
-    begin
-      // empty the cache
-      For i := 0 to Pred(fCacheCount) do
-        FreeBlock(fCacheData[i]);
-      SetLength(fCacheData,0);
-      fCacheCount := 0;
-    end;
+  Result := 0;
+  For i := LowIndex to HighIndex do
+    Inc(Result,fSegments[i].AllocatedBlockCount);
 finally
-  InternalUnlock;
+  ThreadLockRelease;
+end;
+end;
+
+//------------------------------------------------------------------------------
+
+Function TMassBlockAlloc.FreeBlockCount: Integer;
+var
+  i:  Integer;
+begin
+ThreadLockAcquire;
+try
+  Result := 0;
+  For i := LowIndex to HighIndex do
+    Inc(Result,fSegments[i].FreeBlockCount);
+finally
+  ThreadLockRelease;
+end;
+end;
+
+//------------------------------------------------------------------------------
+
+Function TMassBlockAlloc.TotalReservedMemory: TMemSize;
+var
+  i:  Integer;
+begin
+ThreadLockAcquire;
+try
+  Result := 0;
+  For i := LowIndex to HighIndex do
+    Inc(Result,fSegments[i].ReservedMemory);
+finally
+  ThreadLockRelease;
+end;
+end;
+
+//------------------------------------------------------------------------------
+
+Function TMassBlockAlloc.TotalBlocksMemory: TMemSize;
+var
+  i:  Integer;
+begin
+ThreadLockAcquire;
+try
+  Result := 0;
+  For i := LowIndex to HighIndex do
+    Inc(Result,fSegments[i].BlocksMemory);
+finally
+  ThreadLockRelease;
+end;
+end;
+
+//------------------------------------------------------------------------------
+
+Function TMassBlockAlloc.TotalAllocatedMemory: TMemSize;
+var
+  i:  Integer;
+begin
+ThreadLockAcquire;
+try
+  Result := 0;
+  For i := LowIndex to HighIndex do
+    Inc(Result,fSegments[i].AllocatedMemory);
+finally
+  ThreadLockRelease;
+end;
+end;
+
+//------------------------------------------------------------------------------
+
+Function TMassBlockAlloc.TotalWastedMemory: TMemSize;
+var
+  i:  Integer;
+begin
+ThreadLockAcquire;
+try
+  Result := 0;
+  For i := LowIndex to HighIndex do
+    Inc(Result,fSegments[i].WastedMemory);
+finally
+  ThreadLockRelease;
+end;
+end;
+
+//------------------------------------------------------------------------------
+
+Function TMassBlockAlloc.TotalMemorySize: TMemSize;
+var
+  i:  Integer;
+begin
+ThreadLockAcquire;
+try
+  Result := 0;
+  For i := LowIndex to HighIndex do
+    Inc(Result,fSegments[i].MemorySize);
+finally
+  ThreadLockRelease;
+end;
+end;
+
+//------------------------------------------------------------------------------
+
+Function TMassBlockAlloc.MemoryEfficiency: Double;
+var
+  MemorySize: TMemSize;
+begin
+ThreadLockAcquire;
+try
+  MemorySize := TotalMemorySize;
+  If MemorySize <> 0 then
+    Result := (MemorySize - TotalWastedMemory) / MemorySize
+  else
+    Result := 0.0;
+finally
+  ThreadLockRelease;
+end;
+end;
+
+//------------------------------------------------------------------------------
+
+Function TMassBlockAlloc.MemoryUtilization: Double;
+var
+  BlocksMemory: TMemSize;
+begin
+ThreadLockAcquire;
+try
+  BlocksMemory := TotalBlocksMemory;
+  If BlocksMemory <> 0 then
+    Result := TotalAllocatedMemory / BlocksMemory
+  else
+    Result := 0.0;
+finally
+  ThreadLockRelease;
 end;
 end;
 
