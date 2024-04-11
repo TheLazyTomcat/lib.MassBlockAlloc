@@ -11,11 +11,11 @@
 
     <todo>
 
-  Version <todo> (<todo>)
+  Version 1.0 (<todo>)
 
   Last change <todo>
 
-  ©<todo> František Milt
+  ©2024 František Milt
 
   Contacts:
     František Milt: frantisek.milt@gmail.com
@@ -35,6 +35,7 @@
     <todo>
 
 ===============================================================================}
+{$message 'describe segments'}
 unit MassBlockAlloc;
 {
   MassBlockAlloc_UseAuxExceptions
@@ -71,13 +72,25 @@ unit MassBlockAlloc;
 
 {$IFDEF FPC}
   {$MODE ObjFPC}
-  {$MODESWITCH DuplicateLocals+}
   {$DEFINE FPC_DisableWarns}
   {$MACRO ON}
 {$ENDIF}
 {$H+}
 
 //------------------------------------------------------------------------------
+{
+  AllowLargeSegments
+
+  Quadruples maximum allowed size of segment.
+
+    Segment size is normally limited to 256MiB (1GiB in 64bit builds), so by
+    defining this symbol this limit is increased to 1GiB (4GiB in 64bit builds).
+
+  Not defined by default.
+
+  To enable/define this symbol in a project without changing this library,
+  define project-wide symbol MassBlockAlloc_AllowLargeSegments_On.
+}
 {$UNDEF AllowLargeSegments}
 {$IFDEF MassBlockAlloc_AllowLargeSegments_On}
   {$DEFINE AllowLargeSegments}
@@ -89,14 +102,6 @@ uses
   SysUtils, Classes, SyncObjs,
   AuxTypes, AuxClasses, BitVector, BitOps
   {$IFDEF UseAuxExceptions}, AuxExceptions{$ENDIF};
-
-{===============================================================================
-    Public constants
-===============================================================================}
-const
-  OneKiB = TMemSize(1024);          // one kibibyte (2^10, kilobyte for you oldschools :P)
-  OneMiB = TMemSize(1024 * OneKiB); // one mebibyte (2^20, megabyte)
-  OneGiB = TMemSize(1024 * OneMiB); // one gibibyte (2^30, gigabyte)
 
 {===============================================================================
     Library-specific exception
@@ -113,17 +118,109 @@ type
   EMBAOutOfResources   = class(EMBAException);
 
 {===============================================================================
+    Public constants
+===============================================================================}
+const
+  OneKiB = TMemSize(1024);          // one kibibyte (2^10, kilobyte for you oldschools :P)
+  OneMiB = TMemSize(1024 * OneKiB); // one mebibyte (2^20, megabyte)
+  OneGiB = TMemSize(1024 * OneMiB); // one gibibyte (2^30, gigabyte)
+
+const
+  // maximum size of segment (differs according to system and AllowLargeSegments symbol)
+  MBA_MAX_SEG_SZ = TMemSize({$IFDEF AllowLargeSegments}4 * {$ENDIF}{$IFDEF CPU64bit}OneGiB{$ELSE}256 * OneMiB{$ENDIF});
+  // maximum size of one block
+  MBA_MAX_BLK_SZ = TMemSize(128 * OneMiB);
+
+{===============================================================================
 --------------------------------------------------------------------------------
                                    TMBASegment
 --------------------------------------------------------------------------------
 ===============================================================================}
 type
+  // used to return burst allocation
   TMBAPointerArray = array of Pointer;
 
 // - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
 type
+{
+  TMBASegmentSizingStyle
+
+  Selects method calculating size of segment when one is being created.
+
+    szMinCount  - Size is selected so that the segment will be large enough to
+                  fit at least the prescribed number of blocks. Note that the
+                  segment size is calculated with page size granularity.
+                  BlockCount must be larger than zero and resulting size must
+                  not exceed MBA_MAX_SEG_SZ.
+
+    szMinSize   - Segment will be at least as large as prescribed (ie. never
+                  smaller). Calculated with page size granularity.
+                  MemorySize must be larger than zero and smaller or equal to
+                  MBA_MAX_SEG_SZ.
+
+    szExactSize - Segment will have exactly the given size, irrespective of its
+                  value or page size.
+                  The prescribed size must be large enough to accomodate at
+                  least one block (note that, if MapInSegment is true, this
+                  also includes the allocation map - which is one byte per 8
+                  blocks) and smaller or equal to MBA_MAX_SEG_SZ.
+}
   TMBASegmentSizingStyle = (szMinCount,szMinSize,szExactSize);
 
+{
+  TMBASegmentSettings
+
+  Used to store and pass settings of a segment (instance of TMBASegment).
+
+    FailOnUnfreed - When the segment is being destroyed, there are still some
+                    allocated/unfreed blocks and this option is true, then an
+                    exception of class EMBAInvalidState is raised in destructor.
+                    When false, then the unfreed blocks are ignored and
+                    destructor proceeds normally.
+
+                      default value - True
+
+    MapInSegment  - When true, then the internal map of allocated blocks is
+                    stored in the segment memory (that is, in the same memory
+                    space as blocks).
+                    Otherwise memory for the map is allocated separately.
+
+                      default value - False
+
+    BlockSize     - Requested size of the block, in bytes. Note that size
+                    reserved in the segment for one block might be (much)
+                    larger, depending on selected memory alignment (padding).
+                    Must be larger than zero and smaller than MBA_MAX_BLK_SZ.
+
+                      default value - 0 - Must be set by the user!
+
+    Alignment     - Each block within the segment is guaranteed to have this
+                    memory alignment.
+                    If block size is not an integral multiple of alignment
+                    bytes, then a padding is created between the blocks to
+                    ensure proper alignment of consecutive blocks - this
+                    creates a wasted space, so be aware of it!
+                    You can use this eg. when allocating vectors used in calls
+                    to SSE/AVX.
+
+                      default value - maNone (no alignment)
+
+    SizingStyle   - See description of type TMBASegmentSizingStyle.
+
+                      default value - szMinCount
+
+    BlockCount    - Requested number of blocks. Observed only for SizingStyle
+                    of szMinCount (see description of TMBASegmentSizingStyle
+                    for details).
+
+                      default value - 0 - Must be set by the user!
+
+    MemorySize    - Requested size of segment memory. Observed only for
+                    SizingStyle of szMinSize and szExactSize (see description
+                    of TMBASegmentSizingStyle for details).
+
+                      default value - <none> (not observed for szMinCount)
+}
   TMBASegmentSettings = record
     FailOnUnfreed:  Boolean;
     MapInSegment:   Boolean;
@@ -169,12 +266,22 @@ type
     MemoryPageSize
 
     Returns size of memory page (in bytes) as indicated by operating system for
-    the calling program.
+    the calling process.
   }
     class Function MemoryPageSize: TMemSize; virtual;
     constructor Create(const Settings: TMBASegmentSettings);
     destructor Destroy; override;
+  {
+    LowIndex
+
+    Index of first block in Blocks array property.
+  }
     Function LowIndex: Integer; override;
+  {
+    HighIndex
+
+    Index of last block in Blocks array property.
+  }
     Function HighIndex: Integer; override;
   {
     BufferBlockCount
@@ -187,7 +294,7 @@ type
              checked as this function is considered to be only informative.
   }
     Function BufferBlockCount(BufferSize: TMemSize): Integer; overload; virtual;
-    // address checks
+    //- address checking -------------------------------------------------------
   {
     AddressOwned
 
@@ -221,11 +328,11 @@ type
   {
     BlockIndexOf
 
-    Returns index of block of the given starting address. If the address does
+    Returns index of block with the given starting address. If the address does
     not point to any block, then a negative value is returned.
   }
     Function BlockIndexOf(Block: Pointer): Integer; virtual;
-    // (de)allocation methods
+    //- basic (de)allocation ---------------------------------------------------
   {
     AllocateBlock
 
@@ -256,7 +363,7 @@ type
   {
     CanAllocateBuffer
 
-    Returns true if this segmant can allocate buffer of given size, false
+    Returns true if this segment can allocate buffer of given size, false
     otherwise.
   }
     Function CanAllocateBuffer(BufferSize: TMemSize): Boolean; virtual;
@@ -299,19 +406,19 @@ type
     procedure FreeBuffer(var Buffer: Pointer; BufferSize: TMemSize); virtual;
     {$message 'todo'}
     //procedure BurstAllocate(out Blocks: TMBAPointerArray); virtual;
-    // informative methods
+    //- informative methods (names should be self-explanatory) -----------------
     Function IsFull: Boolean; virtual;
     Function IsEmpty: Boolean; virtual;
     Function AllocatedBlockCount: Integer; virtual;
     Function FreeBlockCount: Integer; virtual;
-    // memory statistics
-    Function ReservedMemory: TMemSize; virtual;   // memory reserved for all blocks
+    //- memory statistics ------------------------------------------------------
+    Function ReservedMemory: TMemSize; virtual;   // memory reserved for all blocks (including potential block padding)
     Function BlocksMemory: TMemSize; virtual;     // memory of all blocks (excluding padding, so only BlockCount * BlockSize)
     Function AllocatedMemory: TMemSize; virtual;  // memory of allocated blocks (excluding padding)
-    Function WastedMemory: TMemSize; virtual;     // all padding (including individual blocks)
+    Function WastedMemory: TMemSize; virtual;     // all padding (including padding of individual blocks)
     Function MemoryEfficiency: Double; virtual;   // (MemorySize - WastedMemory) / MemorySize (ignores unused space of buffers/vectors)
     Function MemoryUtilization: Double; virtual;  // AllocatedMemory / BlocksMemory (ignores unused space of buffers/vectors)
-    // properties
+    //- properties -------------------------------------------------------------
     property Capacity: Integer read GetCapacity;
     property Count: Integer read GetCount;
     property Settings: TMBASegmentSettings read fSettings;
@@ -329,16 +436,135 @@ type
 --------------------------------------------------------------------------------
 ===============================================================================}
 type
+{
+  TMBAAllocatorSettings
+
+  Used to store and pass settings of an allocator (TMassBlockAlloc instance).
+
+    FreeEmptySegments   - When a block is freed and a segment in which it was
+                          freed becomes empty (ie. has no more allocated
+                          blocks), then this segment is immediately freed and
+                          removed when this option is set to true.
+                          When it is set to false, then the empty segment is
+                          kept for further use.
+                          You should carefully consider whether to enable or
+                          disable this option. It can significantly increase
+                          performance, but at the cost of memory space - decide
+                          what is more important to your particular use case.
+
+                            default value - False
+
+    ThreadProtection    - Enables thread protection of the allocator state. You
+                          should always leave this option enabled (true). Only
+                          if you are 100% sure the allocator will be used
+                          within a signle thread, then you might disable it.
+                          Must be set to true if asynchronous cache filling is
+                          to be enabled.
+
+                            default value - True
+
+    BlockCacheSettings  - Settings for block caching.
+
+                          This mechanism pre-allocates number of blocks (count
+                          depends on cache length) and stores them in the cache.
+                          Later, when allocating a block using cached methods,
+                          it is only taken from the cache and returned - this
+                          is usually much faster than normally allocating it.
+                          This also applies to block freeing - instead of
+                          returning it to the segment, is is only placed into
+                          the cache for later re-use.
+
+                          But note that the cache is not automatically refilled
+                          or emptied (when overfilled) - this must be done
+                          manually by calling CacheFill method, but you can
+                          select a convenient time when to do this.
+
+      .Enable             - Enables (true) or disables (false) block caching.
+
+                              default value - True
+
+      .Length             - Length of the block cache (number of blocks it can
+                            store).
+                            Note that the actual size of the cache is double of
+                            this number, but only this number of blocks can ever
+                            be pre-allocated. This is to leave a space for
+                            blocks returned by cache-freeing them.
+                            Must be bigger than zero (when caching is enabled).
+
+                              default value - 128
+
+      .TrustedReturns     - When true, the blocks returned to cache-enabled
+                            freeing are just put into the cache without checking
+                            them for validity. When set to false, all blocks,
+                            before being put to the cache, are checked.
+                            Make sure you enable this option if pointers
+                            returned are not 100% guaranteed to be valid block
+                            pointers.
+
+                              default value - True
+
+      .AsynchronousFill   - Settings for asynchronous cache filling.
+
+                            A background thread is spawned and this thread will,
+                            either on-demand (a call to CacheFill) or after a
+                            timeout (CycleLength), automatically fill the cache.
+
+                            For this to work, the cache must be enabled and also
+                            the thread protection must be enabled.
+
+        ..Enable            - Enables asynchronous filling.
+
+                                default value - False
+
+        ..Interruptable     - When true, then the async. cache filling (blocks
+                              allocation and deallocation) can be interrupted,
+                              otherwise it will run until completion.
+
+                              The async. filling runs in a thread and is
+                              protected by thread lock, the same lock that
+                              de/allocating functions are also acquiring. This
+                              means that, while this is running (which might be
+                              relatively long time), no allocating or
+                              deallocating function can enter the section and
+                              so they will block the call. This might be
+                              undesirable, and for this an iterrupts are
+                              implemented.
+
+                              When enabled - if an async. filling is in process
+                              and a de/allocating function is called, then this
+                              call will set a flag that is constantly checked by
+                              the filling.
+                              When the filling evaluates the flag as being set
+                              (meaning de/alloc. function is waiting to enter),
+                              it will immediatelly stop operation and exit,
+                              allowing the d/a function to continue and do its
+                              work.
+                              The async. filling is then completed in next
+                              iteration of its cycle (after a timeout or when
+                              demanded).
+
+                                default value - True
+
+        ..CycleLength       - Length (in milliseconds) or timeout of one async.
+                              cache filling cycle.
+                              The filling thread waits until a manual demand to
+                              do the filling is made (by calling CacheFill), but
+                              this waiting is not infinite. It will timeout
+                              after the CycleLength milliseconds and perform the
+                              filling at that point automatically (if needed).
+
+                                default value - 1000 (ms, one second)
+}
   TMBAAllocatorSettings = record
     FreeEmptySegments:  Boolean;
     ThreadProtection:   Boolean;
-    CacheSettings:      record
+    BlockCacheSettings: record
       Enable:             Boolean;
       Length:             Integer;
       TrustedReturns:     Boolean;
       AsynchronousFill:   record
         Enable:             Boolean;
-        Interruptable:      Boolean;        
+        Interruptable:      Boolean;
         CycleLength:        UInt32;
       end;
     end;
@@ -349,7 +575,7 @@ const
   DefaultAllocatorSettings: TMBAAllocatorSettings = (
     FreeEmptySegments:  False;
     ThreadProtection:   True;
-    CacheSettings:      (
+    BlockCacheSettings: (
       Enable:             True;
       Length:             128;
       TrustedReturns:     True;
@@ -360,13 +586,14 @@ const
     SegmentSettings:    (
       FailOnUnfreed:      True;
       MapInSegment:       False;
-      BlockSize:          0;      // needs to be set by user
+      BlockSize:          0;
       Alignment:          maNone;
       SizingStyle:        szMinCount;
-      BlockCount:         0));    // needs to be set by user
+      BlockCount:         0));   
 
 // - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
 type
+  // only for internal purposes, do not use anywhere
   TMBACache = record
     Enabled:      Boolean;
     Data:         array of Pointer; // must be thread protected
@@ -379,7 +606,6 @@ type
       FillerThread:   TThread;
     end;
   end;
-  PMBACache = ^TMBACache;
 
 {===============================================================================
     TMassBlockAlloc - class declaration
@@ -407,6 +633,7 @@ type
     procedure Initialize(Settings: TMBAAllocatorSettings); virtual;
     procedure Finalize; virtual;
     // other internals
+    Function InternalCheckBlocks(out Blocks: array of Pointer; out FaultIndex: Integer): Boolean; virtual;
     procedure InternalAllocateBlock(out Block: Pointer; InitMemory: Boolean); virtual;
     procedure InternalFreeBlock(var Block: Pointer); virtual;
     procedure InternalAllocateBlocks(out Blocks: array of Pointer; InitMemory: Boolean); virtual;
@@ -414,56 +641,444 @@ type
     Function InternalCacheFill(AsyncFill: Boolean): Integer; virtual;
   public
     constructor Create(Settings: TMBAAllocatorSettings); overload;
+  {
+    Create(BlockSize,MinBlocksPerSegment,MemoryAlingment)
+
+    Other settings (those not given by the function arguments) are set from
+    DefaultAllocatorSettings constant.
+  }
     constructor Create(BlockSize: TMemSize; MinBlocksPerSegment: Integer; MemoryAlignment: TMemoryAlignment = maNone); overload;
     destructor Destroy; override;
+  {
+    LowIndex
+
+    Lowest valid index for Segments array property.
+  }
     Function LowIndex: Integer; override;
+  {
+    HighIndex
+
+    Highest valid index for Segments array property.
+  }
     Function HighIndex: Integer; override;
+  {
+    ThreadLockAcquire
+
+    Locks the thread protection - a critical section protecting data integrity
+    of the allocator in multi-threaded environment. While the lock is in effect,
+    no other thread can lock it - a try to do so will block until the lock is
+    realeased by a thread that holds the lock.
+
+    Can be called recursively in single thread, but each call to
+    ThreadLockAcquire must be paired by a call to ThreadLockRelease to
+    successfully unlock the section.
+
+    Use this mechanism in multi-threaded environment when you are about to do
+    number of calls and don't want the sequence to be interrupted by requests
+    from other threads.
+  }
     procedure ThreadLockAcquire; virtual;
+  {
+    ThreadLockRelease
+
+    Unlocks the thread protection.
+
+    See ThreadLockAcquire for more details.
+  }
     procedure ThreadLockRelease; virtual;
+  {
+    AllocationAcquire
+
+    Causes interrupt to asynchronous cache filling (if enabled)] and locks the
+    thread protection (see ThreadLockAcquire for more details).
+
+    Can be called recursively, but each call must be paired by a call to
+    AllocationRelease to release the lock and disable interrupt.
+  }
     procedure AllocationAcquire; virtual;
+  {
+    AllocationRelease
+
+    Releases thread lock and decrements async. fill interrupt counter (in that
+    order).
+  }
     procedure AllocationRelease; virtual;
-    // single block (de)allocation
+    //- block checking ---------------------------------------------------------
+    {$message 'todo'}
+  {
+    TMBAValidationInfo = record
+      Address:        Pointer;
+      Owned:          Boolean;
+      Allocated:      Boolean;
+      SegmentIndex:   Integer;
+      SegmentObject:  TMBASegment;
+      BlockIndex:     Integer;
+    end;
+
+    TMBAValidationInfoArray = array of TMBAValidationInfo;
+  }
+    //procedure ValidateBlock(Block: Pointer; out ValidationInfo: TMBAValidationInfo); overload; virtual;
+    //Function ValidateBlock(Block: Pointer): Boolean; overload; virtual;
+    //procedure ValidateBlocks(const Blocks: array of Pointer; out ValidationInfo: TMBAValidationInfoArray); overload; virtual;
+    //Function ValidateBlocks(const Blocks: array of Pointer): Boolean; overload; virtual;
+    //- single block (de)allocation --------------------------------------------
+  {
+    AllocateBlock
+
+    Finds not allocated (free) block in existing segments and returns its
+    address. If no free block is found, then new segment is added and the block
+    is allocated in this segment.
+
+    If InitMemory is set to true, then the returned block is zeroed, otherwise
+    its content is completely undefined and may contain any data.
+  }
     procedure AllocateBlock(out Block: Pointer; InitMemory: Boolean = False); overload; virtual;
     Function AllocateBlock(InitMemory: Boolean = False): Pointer; overload; virtual;
+  {
+    FreeBlock
+
+    Finds segment that owns the passed block and frees it using this segment.
+    The variable pointed to by Block argument is set to nil.
+
+    If the given address does not point to any block within existing segments,
+    then an EMBAInvalidAddress exception is raised.
+  }
     procedure FreeBlock(var Block: Pointer); virtual;
-    // multiple blocks (de)allocation
+    //- multiple blocks (de)allocation -----------------------------------------
+  {
+    AllocateBlocks
+
+    Allocates multiple blocks to fill the given array.
+
+    Init memory set to true ensures memory of all allocated blocks is zeroed.
+
+    Note that it is more efficient (faster) to use this function instead of
+    multiple calls to AllocateBlock.
+  }
     procedure AllocateBlocks(out Blocks: array of Pointer; InitMemory: Boolean = False); virtual;
+  {
+    FreeBlocks
+
+    Frees given blocks and sets them to nil.
+
+    All given blocks are first checked for validity. If any is deemed invalid
+    (eg. does not belong to any existing segment), then an EMBAInvalidAddress
+    exception is raised and NONE of the blocks is freed.
+    
+    Note that there is a slight possibility that an exception will be raised
+    even is some of the blocks are freed. You can easily discern that this
+    happened because the exception will be of class EMBAInvalidValue. Also,
+    you can probe which blocks were freed and which were not - the freed ones
+    will be already set to nil, the unfreed will still have their addresses.
+  }
     procedure FreeBlocks(var Blocks: array of Pointer); virtual;
-    // buffer (de)allocation
+    //- buffer (de)allocation --------------------------------------------------
+  {
+    AllocateBuffer
+
+    Allocates general memory buffer using the segments.
+
+    The allocation is done by finding contiguous sequence of blocks that
+    together give the required size - they are then all marked as allocated and
+    the buffer is simply overlayed on those blocks.    
+
+    The buffer size must be larger than zero, otherwise an EMBAInvalidValue
+    exception is raised. It must also fit into the segments (its size must be
+    smaller or equal to reserved memory of a single segment), otherwise an
+    exception of class EMBAOutOfResources is raised.
+
+    If InitMemory is set to true, then the buffer memory is cleared (set to all
+    zero), otherwise it can contain bogus data.
+
+    Note that the buffer (the address) will be aligned according to memory
+    alignment given in settings.
+
+      WARNING - to free the buffer, do NOT use standard memory management
+                functions, always use FreeBuffer method and make sure you
+                pass the same size there as is passed here.
+  }
     procedure AllocateBuffer(out Buffer: Pointer; BufferSize: TMemSize; InitMemory: Boolean = False); virtual;
+  {
+    FreeBuffer
+
+    Frees the general memory buffer that was previously allocated using
+    AllocateBuffer.
+
+    Make sure you pass the same size as was passed when allocating the buffer.
+  }
     procedure FreeBuffer(var Buffer: Pointer; BufferSize: TMemSize); virtual;
-    // block vector (de)allocation
+    //- block vector (de)allocation --------------------------------------------
+  {
+    AllocateBlockVector
+
+    Allocates a contigous array (vector) of blocks, each of the size given in
+    settings (SegmentSettings.BlockSize) - this is equivalent to allocating
+    a buffer of size VectorLength * BlockSize.
+
+    The blocks are byte-packed, there is no padding between them. Therefore,
+    only the first block (the address of vector) is guaranteed to have proper
+    alignment, consecutive blocks start just where the previous ones ended.
+
+    The VectorLength must be larger than zero, otherwise an EMBAInvalidValue
+    exception is raised. Also, all limits in effect for AllocateBuffer apply
+    to this call.
+  }
     procedure AllocateBlockVector(out Vector: Pointer; VectorLength: Integer; InitMemory: Boolean = False); virtual;
+  {
+    FreeBlockVector
+
+    Frees vector of blocks allocated by AllocateBlockVector - equivalent to
+    calling FreeBuffer with BufferSize set to VectorLength * BlockSize.
+  }
     procedure FreeBlockVector(var Vector: Pointer; VectorLength: Integer); virtual;
-    // cache management
+  {
+    --- Block cache ---
+
+    This mechanism is here to speed-up short allocation and deallocation bursts
+    (also works for random scattered de/allocations).
+
+    It works by pre-allocating given number of blocks and storing them in a
+    simple array (the cache). Then, when cached allocation is called, it merely
+    takes this pre-allocated block from the array and returns it, which is
+    usually much faster than full allocation (search for free block, marking
+    it allocated, ...).
+    Deallocation works the same way - the returned block is only put into the
+    cache and left there for future use, it is not classically freed.
+
+    But note that the cache must be also re-filled/cleaned from time to time.
+    You can either do it manually (by calling CacheFill), or, by enabling
+    asynchronous cache filling, leave it on a background thread.
+  }
+    //- cache management -------------------------------------------------------
+  {
+    CacheCount
+
+    Returns number of pre-allocated blocks available in block cache.
+
+    Note that, if the allocator is used by multiple threads, the number might
+    not reflect reality by the time the function returns, simply because other
+    threads can use the cache immediately as it is unlocked.
+    To ensure the number stays correct, you have to thread-lock the allocator
+    (ThreadLockAcquire) prior to calling CacheCount (remember to unlock it
+    when you are done by calling ThreadLockRelease, otherwise the allocator
+    could not serve other threads).
+  }
     Function CacheCount: Integer; virtual;
+  {
+    CacheFill
+
+    Checks number of pre-allocated blocks present in the block cache. If it is
+    lower than cache length given in settings, then new blocks are allocated
+    and placed in the cache. If it is higher, then blocks over the given number
+    are freed.
+    To put it simpy, this function ensures that the cache contains exactly the
+    number of pre-allocated blocks as indicated in settings.
+
+    If ForceSynchronous is true or when asynchronous filling is disabled, then
+    the action is done directly in the calling context (ie. "here and now").
+    If ForceSynchronous is false and asynchronous filling is enabled, then no
+    action is performed, the call only signals filler thread to do the filling.
+
+    Note that if the cache is disabled, this function does nothing and returns
+    immediately.
+  }
     procedure CacheFill(ForceSynchronous: Boolean = False); virtual;
-    // cached (de)allocation
+    //- cached (de)allocation --------------------------------------------------
+  {
+    CacheAllocateBlock
+
+    Takes pre-allocated block from cache and returns it.
+
+    If InitMemory is true, then the blcok memory is zeroed, otherwise it is
+    left as is and might contain bogus data.
+
+    If the cache is disabled or is empty, then normal allocation is called
+    instead.
+  }
     procedure CacheAllocateBlock(out Block: Pointer; InitMemory: Boolean = False); overload; virtual;
     Function CacheAllocateBlock(InitMemory: Boolean = False): Pointer; overload; virtual;
+  {
+    CacheFreeBlock
+
+    Puts the given block into cache and sets variable pointed to by Block
+    argument to nil.
+
+    If Settings.BlockCacheSettings.TrustedReturns is false, then the block
+    is first checked for validity (eg. whether it belongs to any existing
+    segments) - when this test fails, then an EMBAInvalidAddress exception is
+    raised.
+    If mentioned settings is true (dafault), then the address is not checked.
+    Therefore be careful what you pass here if trusted returns are true, as you
+    might create disgusting bugs when invalid addresses are passed to this
+    function. Also note that the invalid addresses will eventually be caught
+    when the cache is emptied - then you might get seemingly nonsensical
+    exception at any random time.
+
+    If the cache is disabled or is full, then normal freeing is called instead.
+  }
     procedure CacheFreeBlock(var Block: Pointer); virtual;
+  {
+    CacheAllocateBlocks
+
+    Takes multiple blocks from block cache to fill the given array.
+
+    If there is not enough blocks in cache (or the cache is disabled), then
+    blocks not yet allocated are obtained using normal allocation
+    (AllocateBlock[s]).
+
+    If InitMemory is true then memory of all allocated blocks is zeroed.
+  }
     procedure CacheAllocateBlocks(out Blocks: array of Pointer; InitMemory: Boolean = False); virtual;
+  {
+    CacheFreeBlocks
+
+    Places passed blocks into cache for future use and sets their addresses
+    to nil.
+
+    Blocks that cannot fit into the cache are immediately freed using normal
+    means (FreeBlock[s]).
+
+    Note that, if Settings.BlockCacheSettings.TrustedReturns is false, all
+    blocks are first checked for validity. If any is avaluated as invalid then
+    an EMBAInvalidAddress exception is raised and none of the blocks is freed
+    or re-cached.
+    If the option is true, then no checks are performed - see CacheFreeBlock
+    for description of potential problems that migh arise in this case.
+  }
     procedure CacheFreeBlocks(var Blocks: array of Pointer); virtual;
     {$message 'todo'}
     //Function PrepareFor(Count: Integer): Integer; virtual;
     // return all blocks from an empty segment (existing or newly created)
     //procedure BurstAllocateBlocks(out Blocks: TMBAPointerArray); virtual;
-    // informations and statistics (note that all following functions are subject to thread locking)
+    //- informations and statistics --------------------------------------------
+    // NOTE - all following functions are subject to thread locking
+  {
+    SegmentSize
+
+    Returns size of memory (in bytes) a single segment allocates for blocks
+    (and potentially also for allocation map, see MapInSegment option in
+    segment settings).
+    This number should be, unlike BlocksPerSegment, the same for all segments.
+
+    If no segment is present, then one is created, because only the segment can
+    know its own size.
+  }
     Function SegmentSize: TMemSize; virtual;
+  {
+    BlocksPerSegment
+
+    Returns number of blocks in the first segment. If no segment is currently
+    present, then one is created and the number obtained from it.
+
+      WARNING - it is entirely possible that each segment will contain
+                different number of blocks, be aware of this and do not take
+                number returned by this function as some immutable constant,
+                it is here only to provide a close estimate (true value will
+                probably not differ by more than 1).
+  }
     Function BlocksPerSegment: Integer; virtual;
+  {
+    AllocatedBlockCount
+
+    Returns number of allocated blocks in all segments.
+
+    While the number is accurate, it might not correspond to reality by the
+    time the function returns if more than one thread is using the allocator.
+    If you want to use this number in capacity other than informative, then
+    make sure to thread-lock the allocator before calling it (and unlock it
+    after you are done).
+  }
     Function AllocatedBlockCount: Integer; virtual;
+  {
+    FreeBlockCount
+
+    Returns number of free (unallocated) blocks in all segments.
+
+    See AllocatedBlockCount for info about thread-related issues.
+  }
     Function FreeBlockCount: Integer; virtual;
+  {
+    TotalReservedMemory
+
+    Returns size of memory (in bytes) reserved for all blocks (both allocated
+    and unallocated) in all segments (including padding of individual blocks).
+
+    See AllocatedBlockCount for info about thread-related issues.
+  }
     Function TotalReservedMemory: TMemSize; virtual;
+  {
+    TotalBlocksMemory
+
+    Returns size (in bytes) of all blocks (allocated and unallocated) in all
+    segments (excluding padding of individual blocks).
+
+    See AllocatedBlockCount for info about thread-related issues.
+  }
     Function TotalBlocksMemory: TMemSize; virtual;
+  {
+    TotalAllocatedMemory
+
+    Returns size (in bytes) of all allocated blocks in all segments (excluding
+    padding of individual blocks).
+
+    See AllocatedBlockCount for info about thread-related issues.
+  }
     Function TotalAllocatedMemory: TMemSize; virtual;
+  {
+    TotalWastedMemory
+
+    Returns size (in bytes) of all wasted space (all padding) in all segments.
+
+    See AllocatedBlockCount for info about thread-related issues.
+  }
     Function TotalWastedMemory: TMemSize; virtual;
+  {
+    TotalMemorySize
+
+    Returns size (in bytes) of all memory allocated by all segments for blocks
+    and potentialy also allocation maps.
+
+    See AllocatedBlockCount for info about thread-related issues.
+  }
     Function TotalMemorySize: TMemSize; virtual;
+  {
+    MemoryEfficiency
+
+    Returns efficiency of allocated memory - ie. how much of it is actually
+    used for useful stuff. Returned as a normalized value, so in interval [0,1],
+    and calculated as:
+
+      (TotalMemorySize - TotalWastedMemory) / TotalMemorySize
+
+    Note that this ignores unused space of allocated buffers and vectors.
+
+    See AllocatedBlockCount for info about thread-related issues.
+  }
     Function MemoryEfficiency: Double; virtual;
+  {
+    MemoryUtilization
+
+    Indicates how much of the blocks memory is being used for allocated blocks.
+    Returned as a normalized value (interval [0,1]) and calculated as:
+
+      TotalAllocatedMemory / TotalBlocksMemory
+
+    Ignores unused space of allocated buffers and vectors.
+
+    See AllocatedBlockCount for info about thread-related issues.
+  }
     Function MemoryUtilization: Double; virtual;
-    // properties
+    //- properties -------------------------------------------------------------
     property Settings: TMBAAllocatorSettings read fSettings;
     property Count: Integer read GetCount;
     property SegmentCount: Integer read GetCount;
+  {
+    Segments
+
+      WARNING - while working on segment taken from this property, make sure
+                you thread-lock the allocator (BEFORE obtaining the object) and
+                do not call any allocating or deallocating methods.
+  }
     property Segments[Index: Integer]: TMBASegment read GetSegment; default;
   end;
 
@@ -480,15 +1095,6 @@ uses
 {$ENDIF}
 
 {===============================================================================
-    Internals
-===============================================================================}
-const
-  // maximum size of segment
-  MBA_MAX_SEG_SZ = TMemSize({$IFDEF AllowLargeSegments}4 * {$ENDIF}{$IFDEF CPU64bit}OneGiB{$ELSE}256 * OneMiB{$ENDIF});
-  // maximum size of one block
-  MBA_MAX_BLK_SZ = TMemSize(128 * OneMiB);
-
-{===============================================================================
     Externals
 ===============================================================================}
 
@@ -499,7 +1105,7 @@ Function errno_ptr: pcInt; cdecl; external name '__errno_location';
 Function sysconf(name: cInt): cLong; cdecl; external;
 
 const
-  _SC_PAGESIZE = 30;  {$message 'check this value'} 
+  _SC_PAGESIZE = 30;
 
 {$ENDIF}
 
@@ -611,7 +1217,7 @@ case fSettings.SizingStyle of
 
                 n = ceil(c / 8)
       }
-        Result := uDivCeilPow2(PredAlignBytes + uDivCeilPow2NC(fSettings.BlockCount,8) +
+        Result := uDivCeilPow2(PredAlignBytes + uDivCeilPow2NC(CvtI2U(fSettings.BlockCount),8) +
           (TMemSize(fSettings.BlockCount) * fReservedBlockSize),PageSize) * PageSize
       else
       {
@@ -775,7 +1381,7 @@ If BufferSize > fReservedBlockSize then
     blocks, if present, is used too).
   }
     RequiredBlockCount := BufferBlockCount(BufferSize);
-    If RequiredBlockCount > 1 then  // this should never happen, but to be sure...
+    If RequiredBlockCount > 1 then 
       begin
         Result := -1;
         // check if there is required number of free blocks
@@ -1188,7 +1794,19 @@ while InterlockedExchangeAdd(fTerminateFlag,0) = 0 do
     begin
       fAllocator.ThreadLockAcquire;
       try
-        fAllocator.InternalCacheFill(True);
+        try  
+          fAllocator.InternalCacheFill(True);
+        except
+          try
+            {$message 'todo'}
+            // acquire exception object
+            // add it to some list in the allocator
+
+            // allocator should re-raise those whenever it is appropriate
+          except
+            // eat all exceptions
+          end;
+        end;
       finally
         fAllocator.ThreadLockRelease;
       end;
@@ -1203,8 +1821,9 @@ constructor TMBAAsyncFillThread.Create(Allocator: TMassBlockAlloc);
 begin
 inherited Create(False);
 FreeOnTerminate := False;
+Priority := tpLowest;
 fAllocator := Allocator;
-fTimeout := fAllocator.Settings.CacheSettings.AsynchronousFill.CycleLength;
+fTimeout := fAllocator.Settings.BlockCacheSettings.AsynchronousFill.CycleLength;
 fCycleEvent := fAllocator.fCache.AsyncFill.CycleEvent;
 fTerminateFlag := 0;
 end;
@@ -1341,8 +1960,8 @@ end;
 procedure TMassBlockAlloc.Initialize(Settings: TMBAAllocatorSettings);
 begin
 // first do settings sanity checks
-If Settings.CacheSettings.Enable and (Settings.CacheSettings.Length <= 0) then
-  raise EMBAInvalidValue.CreateFmt('TMassBlockAlloc.Initialize: Cache length too small (%d).',[Settings.CacheSettings.Length]);
+If Settings.BlockCacheSettings.Enable and (Settings.BlockCacheSettings.Length <= 0) then
+  raise EMBAInvalidValue.CreateFmt('TMassBlockAlloc.Initialize: Cache length too small (%d).',[Settings.BlockCacheSettings.Length]);
 If (Settings.SegmentSettings.BlockSize <= 0) or (Settings.SegmentSettings.BlockSize > MBA_MAX_BLK_SZ) then
   raise EMBAInvalidValue.CreateFmt('TMassBlockAlloc.Initialize: Invalid block size (%u).',[PtrInt(Settings.SegmentSettings.BlockSize)]);
 case Settings.SegmentSettings.SizingStyle of
@@ -1365,17 +1984,17 @@ else
   fThreadLock := nil;
 // prepare cache
 FillChar(fCache,SizeOf(TMBACache),0);
-If fSettings.CacheSettings.Enable then
+If fSettings.BlockCacheSettings.Enable then
   begin
     fCache.Enabled := True;
-    SetLength(fCache.Data,fSettings.CacheSettings.Length * 2);
+    SetLength(fCache.Data,fSettings.BlockCacheSettings.Length * 2);
     fCache.Count := 0;
     InternalCacheFill(False);
-    If fSettings.CacheSettings.AsynchronousFill.Enable and fSettings.ThreadProtection then
+    If fSettings.BlockCacheSettings.AsynchronousFill.Enable and fSettings.ThreadProtection then
       begin
         // prepare asynchronous filling
         fCache.AsyncFill.Enabled := True;
-        fCache.AsyncFill.Interrupts := fSettings.CacheSettings.AsynchronousFill.Interruptable;
+        fCache.AsyncFill.Interrupts := fSettings.BlockCacheSettings.AsynchronousFill.Interruptable;
         fCache.AsyncFill.InterruptFlag := 0;
         fCache.AsyncFill.CycleEvent := TEvent.Create(nil,False,False,'');
         fCache.AsyncFill.FillerThread := TMBAAsyncFillThread.Create(Self);
@@ -1414,6 +2033,31 @@ finally
   ThreadLockRelease;
 end;
 FreeAndNil(fThreadLock);
+end;
+
+//------------------------------------------------------------------------------
+
+Function TMassBlockAlloc.InternalCheckBlocks(out Blocks: array of Pointer; out FaultIndex: Integer): Boolean;
+var
+  i,j: Integer;
+begin
+Result := False;
+FaultIndex := -1;
+For i := Low(Blocks) to High(Blocks) do
+  begin
+    Result := False;
+    For j := LowIndex to HighIndex do
+      If fSegments[j].BlockOwned(Blocks[i]) then
+        begin
+          Result := True;
+          Break{For j};
+        end;
+    If not Result then
+      begin
+        FaultIndex := i;
+        Break{For i};
+      end;
+  end;
 end;
 
 //------------------------------------------------------------------------------
@@ -1485,6 +2129,8 @@ var
   Index,i:  Integer;
   Counter:  Integer;
 begin
+If not InternalCheckBlocks(Blocks,Index) then
+  raise EMBAInvalidAddress.CreateFmt('TMassBlockAlloc.InternalAllocateBlocks: Invalid block address ([%d]%p).',[Index,Blocks[Index]]);
 Counter := Length(Blocks);
 For i := HighIndex downto LowIndex do
   begin
@@ -1503,8 +2149,9 @@ For i := HighIndex downto LowIndex do
             Exit;
         end;
   end;
+// final paranoia check
 If Counter > 0 then
-  raise EMBAInvalidAddress.CreateFmt('TMassBlockAlloc.InternalFreeBlocks: Not all blocks were freed (%d).',[Counter]);
+  raise EMBAInvalidValue.CreateFmt('TMassBlockAlloc.InternalFreeBlocks: Not all blocks were freed (%d).',[Counter]);
 end;
 
 //------------------------------------------------------------------------------
@@ -1557,14 +2204,14 @@ end;
 
 constructor TMassBlockAlloc.Create(BlockSize: TMemSize; MinBlocksPerSegment: Integer; MemoryAlignment: TMemoryAlignment = maNone);
 var
-  Settings: TMBAAllocatorSettings;
+  TempSettings: TMBAAllocatorSettings;
 begin
-Settings := DefaultAllocatorSettings;   
-Settings.SegmentSettings.BlockSize := BlockSize;
-Settings.SegmentSettings.Alignment := MemoryAlignment;
-Settings.SegmentSettings.SizingStyle := szMinCount;
-Settings.SegmentSettings.BlockCount := MinBlocksPerSegment;
-Create(Settings);
+TempSettings := DefaultAllocatorSettings;
+TempSettings.SegmentSettings.BlockSize := BlockSize;
+TempSettings.SegmentSettings.Alignment := MemoryAlignment;
+TempSettings.SegmentSettings.SizingStyle := szMinCount;
+TempSettings.SegmentSettings.BlockCount := MinBlocksPerSegment;
+Create(TempSettings);
 end;
 
 //------------------------------------------------------------------------------
@@ -1856,9 +2503,9 @@ AllocationAcquire;
 try
   If fCache.Count < Length(fCache.Data) then
     begin
-      If not fSettings.CacheSettings.TrustedReturns then
+      If not fSettings.BlockCacheSettings.TrustedReturns then
         If not CheckBlockValidity then
-          raise EMBAInvalidAddress.CreateFmt('TMassBlockAlloc.CacheFreeBlock: Invalid block address (%p).',[Block]); 
+          raise EMBAInvalidAddress.CreateFmt('TMassBlockAlloc.CacheFreeBlock: Invalid block address (%p).',[Block]);
       fCache.Data[fCache.Count] := Block;
       Inc(fCache.Count);
       Block := nil;
@@ -1917,30 +2564,6 @@ end;
 //------------------------------------------------------------------------------
 
 procedure TMassBlockAlloc.CacheFreeBlocks(var Blocks: array of Pointer);
-
-  Function CheckBlocksValidity(out FaultIndex: Integer): Boolean;
-  var
-    i,j: Integer;
-  begin
-    Result := False;
-    FaultIndex := -1;
-    For i := Low(Blocks) to High(Blocks) do
-      begin
-        Result := False;
-        For j := LowIndex to HighIndex do
-          If fSegments[j].BlockOwned(Blocks[i]) then
-            begin
-              Result := True;
-              Break{For j};
-            end;
-        If not Result then
-          begin
-            FaultIndex := i;
-            Break{For i};
-          end;
-      end;
-  end;
-
 var
   Index:      Integer;
   TempBlocks: array of Pointer;
@@ -1952,9 +2575,9 @@ If Length(Blocks) > 0 then
       begin
         AllocationAcquire;
         try
-          If not fSettings.CacheSettings.TrustedReturns then
-            If not CheckBlocksValidity(Index) then
-              raise EMBAInvalidAddress.CreateFmt('TMassBlockAlloc.CacheFreeBlocks: Invalid block address (%p).',[Blocks[Index]]);
+          If not fSettings.BlockCacheSettings.TrustedReturns then
+            If not InternalCheckBlocks(Blocks,Index) then
+              raise EMBAInvalidAddress.CreateFmt('TMassBlockAlloc.CacheFreeBlocks: Invalid block address ([%d]%p).',[Index,Blocks[Index]]);
           Index := Low(Blocks);
           while fCache.Count < Length(fCache.Data) do
             begin
