@@ -9,11 +9,27 @@
 
   MassBlockAlloc
 
-    <todo>
+    This library was designed for situation, where a large number of relatively
+    small blocks of equal size is rapidly allocated and deallocated and where
+    performance in important.
 
-  Version 1.0 (<todo>)
+    As rapid (de)allocation of small data can put default memory manager under
+    a significant load, this library was created to offload this operation from
+    it and (potentially) improve performance.
 
-  Last change <todo>
+    The blocks are not trully allocated and deallocated. The allocator (an
+    instance of class TMassBlockAlloc) allocates memory in large chunks called
+    segments, where each segment can hold many blocks. When a new block is
+    required, it is only selected from a list of unused blocks in a segment.
+    When block is freed, it is only marked as unused in its parent segment.
+
+    Since the memory is managed completely within this library, it is also
+    possible to force the allocator to allocate all the blocks with specific
+    address alignment (eg. for use in vector instructions such as SSE or AVX).
+
+  Version 1.0 (2024-04-14)
+
+  Last change 2024-04-14
 
   ©2024 František Milt
 
@@ -32,25 +48,35 @@
       github.com/TheLazyTomcat/Lib.MassBlockAlloc
 
   Dependencies:
-    <todo>
+    AuxClasses    - github.com/TheLazyTomcat/Lib.AuxClasses
+   *AuxExceptions - github.com/TheLazyTomcat/Lib.AuxExceptions
+    AuxMath       - github.com/TheLazyTomcat/Lib.AuxMath
+    AuxTypes      - github.com/TheLazyTomcat/Lib.AuxTypes
+    BitOps        - github.com/TheLazyTomcat/Lib.BitOps
+    BitVector     - github.com/TheLazyTomcat/Lib.BitVector
+
+  Library AuxExceptions is required only when rebasing local exception
+  classes (see symbol MassBlockAlloc_UseAuxExceptions for details).
+
+  Indirect dependencies:
+    BasicUIM            - github.com/TheLazyTomcat/Lib.BasicUIM
+    BinaryStreamingLite - github.com/TheLazyTomcat/Lib.BinaryStreamingLite
+    SimpleCPUID         - github.com/TheLazyTomcat/Lib.SimpleCPUID
+    StrRect             - github.com/TheLazyTomcat/Lib.StrRect
+    UInt64Utils         - github.com/TheLazyTomcat/Lib.UInt64Utils
+    WinFileInfo         - github.com/TheLazyTomcat/Lib.WinFileInfo
 
 ===============================================================================}
-{$message 'describe segments'}
 unit MassBlockAlloc;
 {
   MassBlockAlloc_UseAuxExceptions
-  All_UseAuxExceptions
 
   If you want library-specific exceptions to be based on more advanced classes
   provided by AuxExceptions library instead of basic Exception class, and don't
   want to or cannot change code in this unit, you can define global symbol
-  MassBlockAlloc_UseAuxExceptions or All_UseAuxExceptions to do so.
-
-    NOTE - if you globally define symbol All_UseAuxExceptions, then exception
-           classes in all units that support his feature will be rebased, not
-           only classes from this unit.
+  MassBlockAlloc_UseAuxExceptions to achieve this.
 }
-{$IF Defined(MassBlockAlloc_UseAuxExceptions) or Defined(All_UseAuxExceptions)}
+{$IF Defined(MassBlockAlloc_UseAuxExceptions)}
   {$DEFINE UseAuxExceptions}
 {$IFEND}
 
@@ -72,6 +98,7 @@ unit MassBlockAlloc;
 
 {$IFDEF FPC}
   {$MODE ObjFPC}
+  {$MODESWITCH DuplicateLocals+}
   {$DEFINE FPC_DisableWarns}
   {$MACRO ON}
 {$ENDIF}
@@ -404,8 +431,15 @@ type
     exception can be raised.
   }
     procedure FreeBuffer(var Buffer: Pointer; BufferSize: TMemSize); virtual;
-    {$message 'todo'}
-    //procedure BurstAllocate(out Blocks: TMBAPointerArray); virtual;
+  {
+    AllocateAll
+
+    If the segment is empty, then it marks all blocks as allocated and returns
+    their addresses in Blocks output parameter (in the order they appear in the
+    segment) - practically allocating all blocks in one go.
+    If this segment is not empty, then an EMBAInvalidState exception is raised.
+  }
+    procedure AllocateAll(out Blocks: TMBAPointerArray); virtual;
     //- informative methods (names should be self-explanatory) -----------------
     Function IsFull: Boolean; virtual;
     Function IsEmpty: Boolean; virtual;
@@ -554,6 +588,12 @@ type
                               filling at that point automatically (if needed).
 
                                 default value - 1000 (ms, one second)
+
+        ..PassExceptions    - Enables passing of cache filling exceptions from
+                              asynchronous filling thread to the allocator. See
+                              cache exceptions for more details.
+
+                                default value - False
 }
   TMBAAllocatorSettings = record
     FreeEmptySegments:  Boolean;
@@ -566,6 +606,7 @@ type
         Enable:             Boolean;
         Interruptable:      Boolean;
         CycleLength:        UInt32;
+        PassExceptions:     Boolean;
       end;
     end;
     SegmentSettings:  TMBASegmentSettings;
@@ -582,30 +623,29 @@ const
       AsynchronousFill:   (
         Enable:             False;
         Interruptable:      True;
-        CycleLength:        1000));
+        CycleLength:        1000;
+        PassExceptions:     False));
     SegmentSettings:    (
       FailOnUnfreed:      True;
       MapInSegment:       False;
       BlockSize:          0;
       Alignment:          maNone;
       SizingStyle:        szMinCount;
-      BlockCount:         0));   
+      BlockCount:         0));
 
-// - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+//------------------------------------------------------------------------------
 type
-  // only for internal purposes, do not use anywhere
-  TMBACache = record
-    Enabled:      Boolean;
-    Data:         array of Pointer; // must be thread protected
-    Count:        Integer;          // -||-
-    AsyncFill:    record
-      Enabled:        Boolean;
-      Interrupts:     Boolean;
-      InterruptFlag:  Integer;      // interlocked access only
-      CycleEvent:     TEvent;
-      FillerThread:   TThread;
-    end;
+  // used to return information when validating a block
+  TMBAValidationInfo = record
+    Address:        Pointer;
+    Owned:          Boolean;
+    Allocated:      Boolean;
+    SegmentIndex:   Integer;      // negative for not-owned blocks
+    SegmentObject:  TMBASegment;  // nil for not-owned blocks
+    BlockIndex:     Integer;      // negative for not-owned blocks
   end;
+
+  TMBAValidationInfoArray = array of TMBAValidationInfo;
 
 {===============================================================================
     TMassBlockAlloc - class declaration
@@ -617,8 +657,24 @@ type
     fSegments:      array of TMBASegment;
     fSegmentCount:  Integer;
     fThreadLock:    TCriticalSection;
-    fCache:         TMBACache;
-    // getters setters
+    fCache:         record
+      Enabled:        Boolean;
+      Data:           array of Pointer; // must be thread protected
+      Count:          Integer;          // -||-
+      AsyncFill:      record
+        Enabled:        Boolean;
+        Interrupts:     Boolean;
+        InterruptFlag:  Integer;        // interlocked access only
+        CycleEvent:     TEvent;
+        FillerThread:   TThread;
+        Exceptions:     record          // thread protect entire subrecord
+          Objects:        array[0..255] of TObject;
+          Count:          Integer;
+          Start:          Integer;
+        end;
+      end;
+    end;
+    // getters, setters
     Function GetSegment(Index: Integer): TMBASegment; virtual;
     // inherited list methods
     Function GetCapacity: Integer; override;
@@ -633,12 +689,14 @@ type
     procedure Initialize(Settings: TMBAAllocatorSettings); virtual;
     procedure Finalize; virtual;
     // other internals
-    Function InternalCheckBlocks(out Blocks: array of Pointer; out FaultIndex: Integer): Boolean; virtual;
+    Function InternalCheckBlocks(var Blocks: array of Pointer; out FaultIndex: Integer): Boolean; virtual;
     procedure InternalAllocateBlock(out Block: Pointer; InitMemory: Boolean); virtual;
     procedure InternalFreeBlock(var Block: Pointer); virtual;
     procedure InternalAllocateBlocks(out Blocks: array of Pointer; InitMemory: Boolean); virtual;
     procedure InternalFreeBlocks(var Blocks: array of Pointer); virtual;
     Function InternalCacheFill(AsyncFill: Boolean): Integer; virtual;
+    // cache exceptions intarnals
+    procedure CacheExceptionsAdd(ExceptObject: TObject); virtual;
   public
     constructor Create(Settings: TMBAAllocatorSettings); overload;
   {
@@ -703,24 +761,51 @@ type
     order).
   }
     procedure AllocationRelease; virtual;
-    //- block checking ---------------------------------------------------------
-    {$message 'todo'}
+    //- block validation (checking) --------------------------------------------
   {
-    TMBAValidationInfo = record
-      Address:        Pointer;
-      Owned:          Boolean;
-      Allocated:      Boolean;
-      SegmentIndex:   Integer;
-      SegmentObject:  TMBASegment;
-      BlockIndex:     Integer;
-    end;
+    ValidateBlock
 
-    TMBAValidationInfoArray = array of TMBAValidationInfo;
+    Returns validation information of the given block in ValidationInfo output
+    argument.
+
+      WARNING - the returned data might not be valid by the time the function
+                returns if the allocator is used by multiple threads. If you
+                want to work with the data (and especially with the segment
+                object) make sure to do the call and data processing inside
+                a thread lock (ThreadLockAcquire, ThreadLockRelease).
   }
-    //procedure ValidateBlock(Block: Pointer; out ValidationInfo: TMBAValidationInfo); overload; virtual;
-    //Function ValidateBlock(Block: Pointer): Boolean; overload; virtual;
-    //procedure ValidateBlocks(const Blocks: array of Pointer; out ValidationInfo: TMBAValidationInfoArray); overload; virtual;
-    //Function ValidateBlocks(const Blocks: array of Pointer): Boolean; overload; virtual;
+    procedure ValidateBlock(Block: Pointer; out ValidationInfo: TMBAValidationInfo); overload; virtual;
+  {
+    ValidateBlock
+
+    Returns true when the block is deemed valid, which means it is both owned
+    by this allocator (ie. the address actually points to start of a block
+    within existing segment owned by this object) and allocated (was previously
+    allocated by this allocator), false otherwise.
+  }
+    Function ValidateBlock(Block: Pointer): Boolean; overload; virtual;
+  {
+    ValidateBlocks
+
+    Returns validation information for all given blocks in ValidationInfo
+    output array argument.
+
+    The ValidationInfo array will have the same length as Blocks and
+    information for each block will be placed at corresponding index in the
+    output (Block[n] -> ValidationInfo[n]).
+
+    See ValidateBlock for information about multi-threading issues.
+  }
+    procedure ValidateBlocks(const Blocks: array of Pointer; out ValidationInfo: TMBAValidationInfoArray); overload; virtual;
+  {
+    ValidateBlocks
+
+    Returns true when all given blocks are owned by this allocator and are also
+    all allocated, false otherwise.
+
+    If no block is passed in the Block array, then false is returned.
+  }
+    Function ValidateBlocks(const Blocks: array of Pointer): Boolean; overload; virtual;
     //- single block (de)allocation --------------------------------------------
   {
     AllocateBlock
@@ -794,8 +879,9 @@ type
     alignment given in settings.
 
       WARNING - to free the buffer, do NOT use standard memory management
-                functions, always use FreeBuffer method and make sure you
-                pass the same size there as is passed here.
+                functions or methods for blocks freeing, always use FreeBuffer
+                method and make sure you pass the same size there as is passed
+                here.
   }
     procedure AllocateBuffer(out Buffer: Pointer; BufferSize: TMemSize; InitMemory: Boolean = False); virtual;
   {
@@ -822,6 +908,9 @@ type
     The VectorLength must be larger than zero, otherwise an EMBAInvalidValue
     exception is raised. Also, all limits in effect for AllocateBuffer apply
     to this call.
+
+      WARNING - always use FreeBlockVector to free the returned address and
+                make sure to pass the same length as was used in allocation.
   }
     procedure AllocateBlockVector(out Vector: Pointer; VectorLength: Integer; InitMemory: Boolean = False); virtual;
   {
@@ -831,6 +920,7 @@ type
     calling FreeBuffer with BufferSize set to VectorLength * BlockSize.
   }
     procedure FreeBlockVector(var Vector: Pointer; VectorLength: Integer); virtual;
+    //- cache management -------------------------------------------------------
   {
     --- Block cache ---
 
@@ -849,7 +939,6 @@ type
     You can either do it manually (by calling CacheFill), or, by enabling
     asynchronous cache filling, leave it on a background thread.
   }
-    //- cache management -------------------------------------------------------
   {
     CacheCount
 
@@ -883,6 +972,64 @@ type
     immediately.
   }
     procedure CacheFill(ForceSynchronous: Boolean = False); virtual;
+    //- cache eceptions management ---------------------------------------------
+  {
+    Cache exceptions
+
+    If any exception is raised by cache filling routine when it is called by
+    the asynchronous filling thread, then it cannot be left unhandled as that
+    would prematurely kill the thread. And because the thread is not under
+    control of the user, it might be undesirable to just silently drop it.
+
+    This mechanism is here to inform code using the allocator about exceptions
+    that occured in the async. filling thread.
+
+    When an exception is raised during filling, it is intercepted, its object
+    is acquired (ie. ensured that it will not be automatically destroyed) and
+    then passed to the allocator which stores this object in an internal list.
+
+    Exception objects in this list can then be popped from this list or
+    re-raised in the context of thread that is using the allocator.
+
+      NOTE - the list has maximum length that cannot exceeded (currently 256
+             items). If it becomes full and new exception is added to it, then
+             the oldest stored exception is freed and the one replaces it.
+  }
+  {
+    CacheExceptionsCount
+
+    Returns number of exception objects stored in the internal list.
+
+    Note that this number might not reflect reality by the time the function
+    returns. If you plan to use it, make sure to call it while the allocator
+    is thread-locked (ThreadLockAcquire/ThreadLockRelease).
+  }
+    Function CacheExceptionsCount: Integer; virtual;
+  {
+    CacheExceptionsPop
+
+    Returns oldest stored exception object and removes it from the list.
+
+    If no object is stored, then nil is returned.
+
+      WARNING - as the object is removed from the internal list, you are
+                henceforth responsible for its destruction (free it!).
+  }
+    Function CacheExceptionsPop: TObject; virtual;
+  {
+    CacheExceptionsRaise
+
+    Removes oldest exception object from the list and raises it.
+
+    If no object is stored, then nothing happens and the method just exits.
+  }
+    procedure CacheExceptionsRaise; virtual;
+  {
+    CacheExceptionsClear
+
+    Frees and removes all stored exception objects.
+  }
+    procedure CacheExceptionsClear; virtual;
     //- cached (de)allocation --------------------------------------------------
   {
     CacheAllocateBlock
@@ -946,10 +1093,32 @@ type
     for description of potential problems that migh arise in this case.
   }
     procedure CacheFreeBlocks(var Blocks: array of Pointer); virtual;
-    {$message 'todo'}
-    //Function PrepareFor(Count: Integer): Integer; virtual;
-    // return all blocks from an empty segment (existing or newly created)
-    //procedure BurstAllocateBlocks(out Blocks: TMBAPointerArray); virtual;
+    //- other allocation routines ----------------------------------------------
+  {
+    PrepareFor
+
+    Ensures that there is at least Count number of free (unallocated) blocks
+    in existing segments, creating new segments if necessary.
+
+    Returns number of free blocks after the call. Note that in multi-threaded
+    environment this number might be incorrect by the time the method returns.
+    Use thread locking abound the call if you want to work with returned value.
+  }
+    Function PrepareFor(Count: Integer): Integer; virtual;
+  {
+    BurstAllocateBlocks
+
+    Finds an empty segment or, when none is found, creates a new one, and then
+    allocates all its blocks and returns their addresses in Blocks array.
+
+    This function always allocates entire segment, it will newer use partially
+    full segments (even is only one block is allocated there).
+
+    Length of the returned array will be close to a value returned by method
+    BlocksPerSegment, but it cannot be guaranteed it will be the same (see
+    BlocksPerSegment for explanation).
+  }
+    procedure BurstAllocateBlocks(out Blocks: TMBAPointerArray); virtual;
     //- informations and statistics --------------------------------------------
     // NOTE - all following functions are subject to thread locking
   {
@@ -1429,9 +1598,7 @@ class Function TMBASegment.MemoryPageSize: TMemSize;
 var
   SystemInfo: TSystemInfo;
 begin
-{$IFDEF FPC}
-SystemInfo := Default(TSystemInfo);
-{$ENDIF}
+FillChar(Addr(SystemInfo)^,SizeOf(TSystemInfo),0);
 GetSystemInfo(SystemInfo);
 Result := TMemSize(SystemInfo.dwPageSize);
 {$ELSE}
@@ -1684,6 +1851,24 @@ end;
 
 //------------------------------------------------------------------------------
 
+procedure TMBASegment.AllocateAll(out Blocks: TMBAPointerArray);
+var
+  i:  Integer;
+begin
+If IsEmpty then
+  begin
+    Blocks := nil;
+    SetLength(Blocks,fBlockCount);
+    Blocks[Low(Blocks)] := fLowAddress;
+    For i := Succ(Low(Blocks)) to High(Blocks) do
+      Blocks[i] := PtrAdvance(Blocks[Pred(i)],fReservedBlockSize);
+    fAllocationMap.Fill(True);
+  end
+else EMBAInvalidState.CreateFmt('TMBASegment.AllocateAll: Some (%d) blocks are already allocated.',[fAllocationMap.PopCount]);
+end;
+
+//------------------------------------------------------------------------------
+
 Function TMBASegment.IsFull: Boolean;
 begin
 Result := fAllocationMap.IsFull;
@@ -1770,14 +1955,15 @@ end;
 type
   TMBAAsyncFillThread = class(TThread)
   protected
-    fAllocator:     TMassBlockAlloc;
-    fTimeout:       UInt32;
-    fCycleEvent:    TEvent;
-    fTerminateFlag: Integer;
+    fAllocator:       TMassBlockAlloc;
+    fTimeout:         UInt32;
+    fPassExceptions:  Boolean;
+    fCycleEvent:      TEvent;
+    fTerminateFlag:   Integer;
     procedure Execute; override;
   public
     constructor Create(Allocator: TMassBlockAlloc);
-    procedure Terminate; virtual; // hides inherited static method
+    procedure FlagTerminate; virtual;
   end;
 
 {===============================================================================
@@ -1790,27 +1976,29 @@ type
 procedure TMBAAsyncFillThread.Execute;
 begin
 while InterlockedExchangeAdd(fTerminateFlag,0) = 0 do
-  If fCycleEvent.WaitFor(fTimeout) <> wrError then
-    begin
-      fAllocator.ThreadLockAcquire;
-      try
-        try  
-          fAllocator.InternalCacheFill(True);
-        except
+  try
+    If fCycleEvent.WaitFor(fTimeout) <> wrError then
+      begin
+        fAllocator.ThreadLockAcquire;
+        try
           try
-            {$message 'todo'}
-            // acquire exception object
-            // add it to some list in the allocator
-
-            // allocator should re-raise those whenever it is appropriate
+            fAllocator.InternalCacheFill(True);
           except
-            // eat all exceptions
+            on E: Exception do
+              If fPassExceptions then
+                begin
+                  // prevent automatic destruction of current exception object
+                  AcquireExceptionObject;
+                  fAllocator.CacheExceptionsAdd(E);
+                end;
           end;
+        finally
+          fAllocator.ThreadLockRelease;
         end;
-      finally
-        fAllocator.ThreadLockRelease;
       end;
-    end;
+  except
+    // eat all exceptions, do not let them bubble out of the thread
+  end;
 end;
 
 {-------------------------------------------------------------------------------
@@ -1824,13 +2012,14 @@ FreeOnTerminate := False;
 Priority := tpLowest;
 fAllocator := Allocator;
 fTimeout := fAllocator.Settings.BlockCacheSettings.AsynchronousFill.CycleLength;
+fPassExceptions := fAllocator.Settings.BlockCacheSettings.AsynchronousFill.PassExceptions;
 fCycleEvent := fAllocator.fCache.AsyncFill.CycleEvent;
 fTerminateFlag := 0;
 end;
 
 //------------------------------------------------------------------------------
 
-procedure TMBAAsyncFillThread.Terminate;
+procedure TMBAAsyncFillThread.FlagTerminate;
 begin
 InterlockedIncrement(fTerminateFlag);
 end;
@@ -1983,7 +2172,7 @@ If fSettings.ThreadProtection then
 else
   fThreadLock := nil;
 // prepare cache
-FillChar(fCache,SizeOf(TMBACache),0);
+FillChar(fCache,SizeOf(fCache),0);
 If fSettings.BlockCacheSettings.Enable then
   begin
     fCache.Enabled := True;
@@ -2008,25 +2197,27 @@ procedure TMassBlockAlloc.Finalize;
 var
   i:  Integer;
 begin
-If fCache.AsyncFill.Enabled then
+// check the objects, not only whether the async. fill is enabled (rollback in case of constructor exception)
+If Assigned(fCache.AsyncFill.CycleEvent) and Assigned(fCache.AsyncFill.FillerThread) then
   begin
     // finalize asynch filling
-    TMBAAsyncFillThread(fCache.AsyncFill.FillerThread).Terminate;
+    TMBAAsyncFillThread(fCache.AsyncFill.FillerThread).FlagTerminate;
     fCache.AsyncFill.CycleEvent.SetEvent;
-  {
-    We need to release the thread lock here, otherwise the filler thread can
-    enter a deadlock.
-  }
     fCache.AsyncFill.FillerThread.WaitFor;
     FreeAndNil(fCache.AsyncFill.FillerThread);
     FreeAndNil(fCache.AsyncFill.CycleEvent);
+    CacheExceptionsClear;
   end;
 // empty cache and free remaining segments
 ThreadLockAcquire;
 try
   // there is no need to check whether cache is enabled
   For i := Low(fCache.Data) to Pred(fCache.Count) do
-    InternalFreeBlock(fCache.Data[i]);
+    try
+      InternalFreeBlock(fCache.Data[i]);
+    except
+      // eat exceptions from invalid blocks, we are ending, so... \('_')/
+    end;
   SetLength(fCache.Data,0);
   ClearSegments;
 finally
@@ -2037,7 +2228,7 @@ end;
 
 //------------------------------------------------------------------------------
 
-Function TMassBlockAlloc.InternalCheckBlocks(out Blocks: array of Pointer; out FaultIndex: Integer): Boolean;
+Function TMassBlockAlloc.InternalCheckBlocks(var Blocks: array of Pointer; out FaultIndex: Integer): Boolean;
 var
   i,j: Integer;
 begin
@@ -2074,7 +2265,8 @@ For i := HighIndex downto LowIndex do
       Exit;
     end;
 // no free block in existing segments, add new one
-fSegments[AddSegment].AllocateBlock(Block,InitMemory);
+i := AddSegment;
+fSegments[i].AllocateBlock(Block,InitMemory);
 end;
 
 //------------------------------------------------------------------------------
@@ -2102,8 +2294,19 @@ var
   i:      Integer;
 
   procedure AllocateFromSegment(SegmentIndex: Integer);
+  var
+    Burst:  TMBAPointerArray;
+    j:      Integer;
   begin
-    while (Index <= High(Blocks)) and not fSegments[SegmentIndex].IsFull do
+    If ((Length(Blocks) - Index) >= fSegments[SegmentIndex].BlockCount) and fSegments[SegmentIndex].IsEmpty then
+      begin
+        // burst allocation
+        fSegments[SegmentIndex].AllocateAll(Burst);
+        For j := Low(Burst) to High(Burst) do
+           Blocks[Index + j] := Burst[j];
+        Inc(Index,Length(Burst));
+      end
+    else while (Index <= High(Blocks)) and not fSegments[SegmentIndex].IsFull do
       begin
         fSegments[SegmentIndex].AllocateBlock(Blocks[Index],InitMemory);
         Inc(Index);
@@ -2119,7 +2322,10 @@ For i := HighIndex downto LowIndex do
       Exit;
   end;
 while Index <= High(Blocks) do
-  AllocateFromSegment(AddSegment);
+  begin
+    i := AddSegment;
+    AllocateFromSegment(i);
+  end;
 end;
 
 //------------------------------------------------------------------------------
@@ -2183,11 +2389,35 @@ else If fCache.Count > (Length(fCache.Data) shr 1) then
         If AsyncFill and fCache.AsyncFill.Interrupts then
           If InterlockedExchangeAdd(fCache.AsyncFill.InterruptFlag,0) <> 0 then
             Exit;
-        InternalFreeBlock(fCache.Data[i]);
-        Dec(fCache.Count);
-        Dec(Result);
+        try
+          InternalFreeBlock(fCache.Data[i]);
+        finally
+          // always remove the block, even when it raises an exception
+          Dec(fCache.Count);
+          Dec(Result);
+        end;
       end;
   end;
+end;
+
+//------------------------------------------------------------------------------
+
+procedure TMassBlockAlloc.CacheExceptionsAdd(ExceptObject: TObject);
+begin
+      writeln( fCache.AsyncFill.Exceptions.start,' ', fCache.AsyncFill.Exceptions.count);
+// thread lock is expected to be already acquired
+with fCache.AsyncFill.Exceptions do
+  If Count >= Length(Objects) then
+    begin
+      FreeAndNil(Objects[Start]);
+      Objects[Start] := ExceptObject;
+      Start := Succ(Start) mod Length(Objects);
+    end
+  else
+    begin
+      Objects[(Start + Count) mod Length(Objects)] := ExceptObject;
+      Inc(Count);
+    end;
 end;
 
 {-------------------------------------------------------------------------------
@@ -2289,6 +2519,94 @@ end;
 
 //------------------------------------------------------------------------------
 
+procedure TMassBlockAlloc.ValidateBlock(Block: Pointer; out ValidationInfo: TMBAValidationInfo);
+var
+  i,Index:  Integer;
+begin
+// init output
+ValidationInfo.Address := Block;
+ValidationInfo.Owned := False;
+ValidationInfo.Allocated := False;
+ValidationInfo.SegmentIndex := -1;
+ValidationInfo.SegmentObject := nil;
+ValidationInfo.BlockIndex := -1;
+// and now the fun part...
+For i := LowIndex to HighIndex do
+  begin
+    Index := fSegments[i].BlockIndexOf(Block);
+    If fSegments[i].CheckIndex(Index) then
+      begin
+        ValidationInfo.Owned := True;
+        ValidationInfo.Allocated := fSegments[i].AllocationMap[Index];
+        ValidationInfo.SegmentIndex := i;
+        ValidationInfo.SegmentObject := fSegments[i];
+        ValidationInfo.BlockIndex := Index;
+        Break{For i};
+      end
+  end;
+end;
+
+// - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+
+Function TMassBlockAlloc.ValidateBlock(Block: Pointer): Boolean;
+var
+  ValInfo:  TMBAValidationInfo;
+begin
+ValidateBlock(Block,ValInfo);
+Result := ValInfo.Owned and ValInfo.Allocated;
+end;
+
+//------------------------------------------------------------------------------
+
+procedure TMassBlockAlloc.ValidateBlocks(const Blocks: array of Pointer; out ValidationInfo: TMBAValidationInfoArray);
+var
+  i,j:    Integer;
+  Index:  Integer;
+begin
+ValidationInfo := nil;
+SetLength(ValidationInfo,Length(Blocks));
+For i := Low(Blocks) to High(Blocks) do
+  begin
+    ValidationInfo[i].Address := Blocks[i];
+    For j := LowIndex to HighIndex do
+      begin
+        Index := fSegments[j].BlockIndexOf(Blocks[i]);
+        If fSegments[j].CheckIndex(Index) then
+          begin
+            ValidationInfo[i].Owned := True;
+            ValidationInfo[i].Allocated := fSegments[j].AllocationMap[Index];
+            ValidationInfo[i].SegmentIndex := j;
+            ValidationInfo[i].SegmentObject := fSegments[j];
+            ValidationInfo[i].BlockIndex := Index;
+            Break{For j};
+          end;
+      end;
+  end;
+end;
+
+// - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+
+Function TMassBlockAlloc.ValidateBlocks(const Blocks: array of Pointer): Boolean;
+var
+  ValInfo:  TMBAValidationInfoArray;
+  i:        Integer;
+begin
+If Length(Blocks) > 0 then
+  begin
+    ValidateBlocks(Blocks,ValInfo);
+    Result := True;
+    For i := Low(ValInfo) to High(ValInfo) do
+      If not(ValInfo[i].Owned and ValInfo[i].Allocated) then
+        begin
+          Result := False;
+          Break{For i};
+        end;
+  end
+else Result := False;
+end;
+
+//------------------------------------------------------------------------------
+
 procedure TMassBlockAlloc.AllocateBlock(out Block: Pointer; InitMemory: Boolean = False);
 begin
 AllocationAcquire;
@@ -2368,7 +2686,8 @@ If BufferSize > 0 then
         If fSegments[i].TryAllocateBuffer(Buffer,BufferSize,InitMemory) then
           Exit;
       // buffer not allocated in existing segments, add a new one and allocate there
-      fSegments[AddSegment].AllocateBuffer(Buffer,BufferSize,InitMemory);
+      i := AddSegment;
+      fSegments[i].AllocateBuffer(Buffer,BufferSize,InitMemory);
     finally
       AllocationRelease;
     end;
@@ -2452,6 +2771,70 @@ If fCache.Enabled then
       end
     else fCache.AsyncFill.CycleEvent.SetEvent;
   end;
+end;
+
+//------------------------------------------------------------------------------
+
+Function TMassBlockAlloc.CacheExceptionsCount: Integer;
+begin
+ThreadLockAcquire;
+try
+  Result := fCache.AsyncFill.Exceptions.Count;
+finally
+  ThreadLockRelease;
+end;  
+end;
+
+//------------------------------------------------------------------------------
+
+Function TMassBlockAlloc.CacheExceptionsPop: TObject;
+begin
+ThreadLockAcquire;
+try
+  with fCache.AsyncFill.Exceptions do
+    If Count > 0 then
+      begin
+        Result := Objects[Start];
+        Objects[Start] := nil;
+        Dec(Count);
+        Start := Succ(Start) mod Length(Objects);
+      end
+    else Result := nil;
+finally
+  ThreadLockRelease;
+end;
+end;
+
+//------------------------------------------------------------------------------
+
+procedure TMassBlockAlloc.CacheExceptionsRaise;
+var
+  ExceptObject: TObject;
+begin
+// no need to do locking here as we are not directly accesing internal state
+ExceptObject := CacheExceptionsPop;
+If Assigned(ExceptObject) then
+  raise ExceptObject;
+end;
+
+//------------------------------------------------------------------------------
+
+procedure TMassBlockAlloc.CacheExceptionsClear;
+var
+  i:  Integer;
+begin
+ThreadLockAcquire;
+try
+  with fCache.AsyncFill.Exceptions do
+    begin
+      For i := 0 to Pred(Count) do
+        FreeAndNil(Objects[(Start + i) mod Length(Objects)]);
+      Count := 0;
+      Start := 0;
+    end;
+finally
+  ThreadLockRelease;
+end;
 end;
 
 //------------------------------------------------------------------------------
@@ -2545,6 +2928,7 @@ If Length(Blocks) > 0 then
           If Index < High(Blocks) then
             begin
               // more than one block needs to be allocated
+              TempBlocks := nil;
               SetLength(TempBlocks,Length(Blocks) - Index);
               InternalAllocateBlocks(TempBlocks,InitMemory);
               For i := Low(TempBlocks) to High(TempBlocks) do
@@ -2591,6 +2975,7 @@ If Length(Blocks) > 0 then
           If Index < High(Blocks) then
             begin
               // several blocks needs to be freed
+              TempBlocks := nil;
               SetLength(TempBlocks,Length(Blocks) - Index);
               For i := Low(TempBlocks) to High(TempBlocks) do
                 begin
@@ -2608,6 +2993,50 @@ If Length(Blocks) > 0 then
       end
     else FreeBlocks(Blocks);
   end
+end;
+
+//------------------------------------------------------------------------------
+
+Function TMassBlockAlloc.PrepareFor(Count: Integer): Integer;
+var
+  FreeBlocksCnt:  Integer;
+  SegmentIndex:   Integer;
+begin
+ThreadLockAcquire;
+try
+  FreeBlocksCnt := FreeBlockCount;
+  while FreeBlocksCnt < Count do
+    begin
+      SegmentIndex := AddSegment;
+      Inc(FreeBlocksCnt,fSegments[SegmentIndex].BlockCount);
+    end;
+  Result := FreeBlocksCnt;
+finally
+  ThreadLockRelease;
+end;
+end;
+
+//------------------------------------------------------------------------------
+
+procedure TMassBlockAlloc.BurstAllocateBlocks(out Blocks: TMBAPointerArray);
+var
+  i:  Integer;
+begin
+AllocationAcquire;
+try
+  // first look if there is some empty segment already present
+  For i := HighIndex downto LowIndex do
+    If fSegments[i].IsEmpty then
+      begin
+        fSegments[i].AllocateAll(Blocks);
+        Exit;
+      end;
+  // if here, there was no empty segment, so create one and allocate there
+  i := AddSegment;
+  fSegments[i].AllocateAll(Blocks);
+finally
+  AllocationRelease;
+end;
 end;
 
 //------------------------------------------------------------------------------
