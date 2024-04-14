@@ -10,8 +10,8 @@
   MassBlockAlloc
 
     This library was designed for situation, where a large number of relatively
-    small blocks of equal size is rapidly allocated and deallocated and where
-    performance in important.
+    small blocks of equal size is rapidly allocated and deallocated in multi
+    thread environment and where performance is important.
 
     As rapid (de)allocation of small data can put default memory manager under
     a significant load, this library was created to offload this operation from
@@ -29,7 +29,7 @@
 
   Version 1.0 (2024-04-14)
 
-  Last change 2024-04-14
+  Last change 2024-04-28
 
   ©2024 František Milt
 
@@ -49,22 +49,24 @@
 
   Dependencies:
     AuxClasses    - github.com/TheLazyTomcat/Lib.AuxClasses
-   *AuxExceptions - github.com/TheLazyTomcat/Lib.AuxExceptions
+  * AuxExceptions - github.com/TheLazyTomcat/Lib.AuxExceptions
     AuxMath       - github.com/TheLazyTomcat/Lib.AuxMath
     AuxTypes      - github.com/TheLazyTomcat/Lib.AuxTypes
     BitOps        - github.com/TheLazyTomcat/Lib.BitOps
     BitVector     - github.com/TheLazyTomcat/Lib.BitVector
 
-  Library AuxExceptions is required only when rebasing local exception
-  classes (see symbol MassBlockAlloc_UseAuxExceptions for details).
+  Library AuxExceptions is required only when rebasing local exception classes
+  (see symbol MassBlockAlloc_UseAuxExceptions for details).
+
+  Library AuxExceptions might also be required as an indirect dependency.
 
   Indirect dependencies:
-    BasicUIM            - github.com/TheLazyTomcat/Lib.BasicUIM
-    BinaryStreamingLite - github.com/TheLazyTomcat/Lib.BinaryStreamingLite
     SimpleCPUID         - github.com/TheLazyTomcat/Lib.SimpleCPUID
     StrRect             - github.com/TheLazyTomcat/Lib.StrRect
     UInt64Utils         - github.com/TheLazyTomcat/Lib.UInt64Utils
     WinFileInfo         - github.com/TheLazyTomcat/Lib.WinFileInfo
+    BasicUIM            - github.com/TheLazyTomcat/Lib.BasicUIM
+    BinaryStreamingLite - github.com/TheLazyTomcat/Lib.BinaryStreamingLite
 
 ===============================================================================}
 unit MassBlockAlloc;
@@ -79,6 +81,8 @@ unit MassBlockAlloc;
 {$IF Defined(MassBlockAlloc_UseAuxExceptions)}
   {$DEFINE UseAuxExceptions}
 {$IFEND}
+
+//------------------------------------------------------------------------------
 
 {$IF defined(CPU64) or defined(CPU64BITS)}
   {$DEFINE CPU64bit}
@@ -438,8 +442,11 @@ type
     their addresses in Blocks output parameter (in the order they appear in the
     segment) - practically allocating all blocks in one go.
     If this segment is not empty, then an EMBAInvalidState exception is raised.
+
+    InitMemory set to true ensures that all blcck will be zeroed, otherwise
+    their memory can contain bogus data.
   }
-    procedure AllocateAll(out Blocks: TMBAPointerArray); virtual;
+    procedure AllocateAll(out Blocks: TMBAPointerArray; InitMemory: Boolean); virtual;
     //- informative methods (names should be self-explanatory) -----------------
     Function IsFull: Boolean; virtual;
     Function IsEmpty: Boolean; virtual;
@@ -1117,8 +1124,10 @@ type
     Length of the returned array will be close to a value returned by method
     BlocksPerSegment, but it cannot be guaranteed it will be the same (see
     BlocksPerSegment for explanation).
+
+    If InitMemory is true then memory of all allocated blocks is zeroed.
   }
-    procedure BurstAllocateBlocks(out Blocks: TMBAPointerArray); virtual;
+    procedure BurstAllocateBlocks(out Blocks: TMBAPointerArray; InitMemory: Boolean = False); virtual;
     //- informations and statistics --------------------------------------------
     // NOTE - all following functions are subject to thread locking
   {
@@ -1851,7 +1860,7 @@ end;
 
 //------------------------------------------------------------------------------
 
-procedure TMBASegment.AllocateAll(out Blocks: TMBAPointerArray);
+procedure TMBASegment.AllocateAll(out Blocks: TMBAPointerArray; InitMemory: Boolean);
 var
   i:  Integer;
 begin
@@ -1863,6 +1872,8 @@ If IsEmpty then
     For i := Succ(Low(Blocks)) to High(Blocks) do
       Blocks[i] := PtrAdvance(Blocks[Pred(i)],fReservedBlockSize);
     fAllocationMap.Fill(True);
+    If InitMemory then
+      FillChar(fLowAddress^,TMemSize(Length(Blocks)) * fReservedBlockSize,0);
   end
 else EMBAInvalidState.CreateFmt('TMBASegment.AllocateAll: Some (%d) blocks are already allocated.',[fAllocationMap.PopCount]);
 end;
@@ -2301,7 +2312,7 @@ var
     If ((Length(Blocks) - Index) >= fSegments[SegmentIndex].BlockCount) and fSegments[SegmentIndex].IsEmpty then
       begin
         // burst allocation
-        fSegments[SegmentIndex].AllocateAll(Burst);
+        fSegments[SegmentIndex].AllocateAll(Burst,InitMemory);
         For j := Low(Burst) to High(Burst) do
            Blocks[Index + j] := Burst[j];
         Inc(Index,Length(Burst));
@@ -3018,7 +3029,7 @@ end;
 
 //------------------------------------------------------------------------------
 
-procedure TMassBlockAlloc.BurstAllocateBlocks(out Blocks: TMBAPointerArray);
+procedure TMassBlockAlloc.BurstAllocateBlocks(out Blocks: TMBAPointerArray; InitMemory: Boolean = False);
 var
   i:  Integer;
 begin
@@ -3028,12 +3039,12 @@ try
   For i := HighIndex downto LowIndex do
     If fSegments[i].IsEmpty then
       begin
-        fSegments[i].AllocateAll(Blocks);
+        fSegments[i].AllocateAll(Blocks,InitMemory);
         Exit;
       end;
   // if here, there was no empty segment, so create one and allocate there
   i := AddSegment;
-  fSegments[i].AllocateAll(Blocks);
+  fSegments[i].AllocateAll(Blocks,InitMemory);
 finally
   AllocationRelease;
 end;
