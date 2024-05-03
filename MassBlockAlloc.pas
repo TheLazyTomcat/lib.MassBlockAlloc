@@ -61,12 +61,12 @@
   Library AuxExceptions might also be required as an indirect dependency.
 
   Indirect dependencies:
+    BasicUIM            - github.com/TheLazyTomcat/Lib.BasicUIM
+    BinaryStreamingLite - github.com/TheLazyTomcat/Lib.BinaryStreamingLite
     SimpleCPUID         - github.com/TheLazyTomcat/Lib.SimpleCPUID
     StrRect             - github.com/TheLazyTomcat/Lib.StrRect
     UInt64Utils         - github.com/TheLazyTomcat/Lib.UInt64Utils
     WinFileInfo         - github.com/TheLazyTomcat/Lib.WinFileInfo
-    BasicUIM            - github.com/TheLazyTomcat/Lib.BasicUIM
-    BinaryStreamingLite - github.com/TheLazyTomcat/Lib.BinaryStreamingLite
 
 ===============================================================================}
 unit MassBlockAlloc;
